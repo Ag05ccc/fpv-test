@@ -17,7 +17,7 @@ Usage:
 """
 
 import argparse
-from drone_tracker import PipelineConfig, TrackingPipeline, PIDGains
+from modules import PipelineConfig, TrackingPipeline, PIDGains
 
 
 def main():

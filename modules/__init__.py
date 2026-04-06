@@ -1,5 +1,5 @@
 """
-drone_tracker - Modular visual target tracking and PID control for Betaflight FC.
+modules - Visual target tracking and PID control for Betaflight FC.
 """
 
 from .controller import PIDGains
