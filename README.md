@@ -25,9 +25,13 @@ AUX1 off             AUX1 on              AUX2 on
                   normally             roll/pitch/yaw
 ```
 
-- **IDLE**: Pi only reads AUX channels. Not sending RC. Pilot has full control.
-- **ARMED**: Camera started, systems ready. Still not sending RC. Pilot has full control.
-- **TRACKING**: Tracker active, Pi sends MSP_SET_RAW_RC. Pi controls the drone.
+| Switch | State | What happens | Who controls drone |
+|--------|-------|---|---|
+| Both off | **IDLE** | Pi only reads AUX channels | Pilot (real RX) |
+| AUX1 on | **ARMED** | Camera starts, systems ready | Pilot (real RX) |
+| AUX1+AUX2 on | **TRACKING** | Tracker + PID active, Pi sends RC | Pi (MSP Override) |
+| AUX2 off | back to **ARMED** | Pi stops sending RC | Pilot (real RX) |
+| AUX1 off | back to **IDLE** | Camera stops | Pilot (real RX) |
 
 When any AUX switch goes low, Pi **stops sending RC** and the real receiver
 takes over immediately. No failsafe.
