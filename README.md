@@ -10,6 +10,111 @@ USB Camera -> CameraCapture (threaded) -> ObjectTracker (CSRT/KCF)
     -> GCSLink (UDP telemetry) -> Ground Control Station (Ethernet)
 ```
 
+## Project Structure
+
+```
+modules/
+  __init__.py       - Package exports
+  camera.py         - Threaded OpenCV video capture
+  tracker.py        - CSRT / KCF object tracking
+  controller.py     - PID controllers + rate-limited flight control
+  msp.py            - MSPv1 serial protocol for Betaflight
+  gcs.py            - UDP telemetry to ground control station
+  pipeline.py       - Two-stage state machine + control loop
+example.py          - CLI entry point
+quick_gcs.py        - Minimal telemetry viewer for testing
+```
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Testing on a PC (Desk Testing)
+
+You can test the full system on your PC using the FC's USB-C port.
+Your PC acts as both the companion board (running the pipeline) and the GCS
+(receiving telemetry). No soldering required.
+
+### What you need
+- FC connected to PC via USB-C
+- USB webcam (or laptop camera)
+- RC transmitter + receiver bound to the FC (for AUX switch testing)
+- Close Betaflight Configurator first (it locks the USB port)
+
+### Find the FC serial port
+```bash
+# Linux
+ls /dev/ttyACM*       # usually /dev/ttyACM0
+
+# Windows
+# Check Device Manager -> Ports -> COMx
+```
+
+### Run pipeline + GCS on the same PC
+
+```bash
+# Terminal 1 — run the tracking pipeline
+python example.py --port /dev/ttyACM0 --gcs-host 127.0.0.1
+
+# Terminal 2 — view live telemetry
+python quick_gcs.py
+```
+
+### Send commands to the pipeline from a third terminal
+
+```bash
+# Stop the pipeline remotely
+python -c "import socket,json; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(json.dumps({'command':'stop'}).encode(),('127.0.0.1',14551))"
+
+# Change follow distance
+python -c "import socket,json; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(json.dumps({'command':'set_target_width','params':{'width':150}}).encode(),('127.0.0.1',14551))"
+```
+
+### What to verify during desk testing
+1. MSP connection works (no serial errors in Terminal 1)
+2. Camera feed is captured (no "Cannot open camera" error)
+3. AUX switches are read correctly (flip switches, watch state transitions in logs)
+4. Telemetry arrives in Terminal 2
+5. Tracker initializes when AUX2 is flipped (you should see "ARMED -> TRACKING" in logs)
+
+---
+
+## Deployment on Drone (Pi / Jetson)
+
+### Hardware wiring
+
+| Companion Board | FC (Betaflight)   |
+|-----------------|-------------------|
+| UART TX (GPIO14)| Spare UART RX     |
+| UART RX (GPIO15)| Spare UART TX     |
+| GND             | GND               |
+
+### Run on the companion board
+
+```bash
+# SSH into your Pi/Jetson, then:
+python example.py --port /dev/ttyAMA0 --gcs-host 192.168.1.100
+```
+
+### Run GCS on your laptop (same network)
+
+```bash
+python quick_gcs.py --port 14550
+```
+
+### Network setup
+The companion board and GCS laptop must be on the same network.
+Options:
+- Wi-Fi (both on the same router)
+- Direct Ethernet cable (set static IPs, e.g. Pi=192.168.1.50, Laptop=192.168.1.100)
+- USB Ethernet adapter on the Pi
+
+---
+
 ## Two-Stage AUX Arming
 
 Tracking uses two AUX switches on your RC transmitter:
@@ -36,6 +141,8 @@ AUX1 off             AUX1 on              AUX2 on
 When any AUX switch goes low, Pi **stops sending RC** and the real receiver
 takes over immediately. No failsafe.
 
+---
+
 ## Betaflight Setup
 
 You need a **real RC receiver** on the FC for normal flying, plus **MSP Override**
@@ -43,6 +150,7 @@ so the Pi can take over specific channels when tracking.
 
 ### 1. Ports tab
 Enable MSP on the UART connected to your companion board (Pi / Jetson).
+For desk testing via USB, MSP is enabled on USB by default.
 
 ### 2. Enable MSP Override (Betaflight CLI)
 ```
@@ -67,19 +175,7 @@ save
 - When AUX2 goes low: MSP Override disabled, real receiver values used instantly
 - Real receiver is always connected, so **no failsafe**
 
-## Project Structure
-
-```
-modules/
-  __init__.py       - Package exports
-  camera.py         - Threaded OpenCV video capture
-  tracker.py        - CSRT / KCF object tracking
-  controller.py     - PID controllers + rate-limited flight control
-  msp.py            - MSPv1 serial protocol for Betaflight
-  gcs.py            - UDP telemetry to ground control station
-  pipeline.py       - Two-stage state machine + control loop
-example.py          - CLI entry point
-```
+---
 
 ## Control Scheme
 
@@ -88,35 +184,41 @@ example.py          - CLI entry point
 - **Roll**: clamped to +/-20 degrees (Betaflight angle mode)
 - **Rate limiter**: smooth channel transitions, prevents sudden attitude changes
 
-## Hardware Wiring
+---
 
-| Companion Board | FC (Betaflight)   |
-|-----------------|-------------------|
-| UART TX         | Spare UART RX     |
-| UART RX         | Spare UART TX     |
-| GND             | GND               |
+## CLI Reference
 
-## Install
+### example.py
 
-```bash
-pip install -r requirements.txt
+```
+--port          FC serial port (default: /dev/ttyAMA0)
+--camera        Camera index (default: 0)
+--tracker       Tracker type: CSRT or KCF (default: CSRT)
+--arm-ch        AUX channel to arm pipeline, 0-indexed (default: 4)
+--track-ch      AUX channel to start tracking, 0-indexed (default: 5)
+--track-size    Fixed bbox size in pixels (default: 100)
+--loop-hz       Control loop frequency (default: 30)
+--show-preview  Show GUI preview window
+--gcs-host      GCS IP address (default: 192.168.1.100)
+--gcs-port      GCS telemetry port (default: 14550)
+--no-gcs        Disable GCS telemetry
 ```
 
-## Quick Start
+### quick_gcs.py
 
-```bash
-# Default: AUX1=ch4 (arm), AUX2=ch5 (track)
-python example.py --port /dev/ttyAMA0
-
-# Custom AUX channels and bbox size
-python example.py --arm-ch 4 --track-ch 5 --track-size 120
-
-# With GCS telemetry
-python example.py --gcs-host 192.168.1.100
-
-# Disable GCS
-python example.py --no-gcs
 ```
+--port          UDP listen port (default: 14550)
+```
+
+### GCS commands (JSON over UDP to port 14551)
+
+| Command | Params | Description |
+|---------|--------|-------------|
+| `stop` | — | Stop the pipeline |
+| `set_target_width` | `{"width": 150}` | Change follow distance |
+| `ping` | — | Heartbeat |
+
+---
 
 ## PID Tuning
 
