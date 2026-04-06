@@ -5,7 +5,7 @@ Visual target tracking + PID control + Betaflight MSP for FPV drones.
 ## Architecture
 
 ```
-USB Camera -> CameraCapture (threaded) -> ObjectTracker (CSRT/KCF/Color)
+USB Camera -> CameraCapture (threaded) -> ObjectTracker (CSRT/KCF)
     -> FlightController (PID yaw + forward) -> MSP_SET_RAW_RC -> Betaflight FC (UART)
     -> GCSLink (UDP telemetry) -> Ground Control Station (Ethernet)
 ```
@@ -16,7 +16,7 @@ USB Camera -> CameraCapture (threaded) -> ObjectTracker (CSRT/KCF/Color)
 modules/
   __init__.py       - Package exports
   camera.py         - Threaded OpenCV video capture
-  tracker.py        - CSRT / KCF / HSV color object tracking
+  tracker.py        - CSRT / KCF object tracking
   controller.py     - PID controllers + rate-limited flight control
   msp.py            - MSPv1 serial protocol for Betaflight
   gcs.py            - UDP telemetry to ground control station
@@ -31,19 +31,31 @@ example.py          - CLI entry point
 - **Roll**: clamped to +/-20 degrees (Betaflight angle mode)
 - **Rate limiter**: smooth channel transitions, prevents sudden attitude changes
 
+## Tracker Initialization
+
+Tracking is started via an **RC AUX switch** read from the FC over MSP:
+
+1. Pilot flips AUX switch (e.g. AUX1, channel index 4)
+2. Pipeline reads the channel value via MSP_RC
+3. When above threshold (default 1500), tracker initializes with a fixed-size
+   bbox centered in the frame
+4. When switch goes low, tracking stops and channels return to neutral
+
+Alternatively, pass `--bbox X Y W H` to skip RC trigger and start immediately.
+
 ## Betaflight Setup
 
-1. Set receiver to MSP in Betaflight CLI:
-   ```
-   set serialrx_provider = MSP
-   save
-   ```
-2. Enable angle mode (always on):
+1. Enable MSP on the UART connected to your companion board (Configurator -> Ports tab).
+2. Enable angle mode via an AUX switch or always-on:
    ```
    aux 0 1 0 900 2100 0 0
    save
    ```
-3. Enable MSP on the UART connected to your companion board (Configurator -> Ports tab).
+3. If using MSP as the sole RC source (no physical receiver):
+   ```
+   set serialrx_provider = MSP
+   save
+   ```
 
 ## Hardware Wiring
 
@@ -62,14 +74,14 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```bash
-# Interactive ROI selection (needs display)
+# RC trigger mode (default) — flip AUX switch to start tracking
 python example.py --port /dev/ttyAMA0
 
-# Headless with predefined bbox
-python example.py --headless --bbox 200 150 80 80
+# Pre-set bbox (skip RC trigger)
+python example.py --bbox 270 190 100 100
 
-# Color tracking (red object)
-python example.py --tracker COLOR --port /dev/ttyS0
+# Custom AUX channel and bbox size
+python example.py --track-ch 5 --track-size 120
 
 # With GCS telemetry
 python example.py --gcs-host 192.168.1.100
@@ -90,7 +102,7 @@ Start with low gains and increase gradually:
 | Class               | Module          | Role                                      |
 |---------------------|-----------------|-------------------------------------------|
 | `CameraCapture`     | `camera.py`     | Threaded frame grabber                    |
-| `ObjectTracker`     | `tracker.py`    | CSRT / KCF / HSV color tracking           |
+| `ObjectTracker`     | `tracker.py`    | CSRT / KCF tracking                       |
 | `PIDController`     | `controller.py` | Generic PID with anti-windup              |
 | `FlightController`  | `controller.py` | Converts tracking to RC channels          |
 | `MSPConnection`     | `msp.py`        | Serial MSP protocol to Betaflight         |

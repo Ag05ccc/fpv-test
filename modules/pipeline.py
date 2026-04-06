@@ -10,7 +10,7 @@ import cv2
 import serial
 
 from .camera import CameraCapture
-from .tracker import ObjectTracker, TrackerType
+from .tracker import ObjectTracker, TrackResult, TrackerType
 from .controller import FlightController, PIDGains
 from .msp import MSPConnection
 from .gcs import GCSLink, TelemetryPacket
@@ -28,8 +28,6 @@ class PipelineConfig:
 
     # Tracker
     tracker_type: str = TrackerType.CSRT
-    hsv_lower: tuple = (0, 100, 100)
-    hsv_upper: tuple = (10, 255, 255)
 
     # PID — yaw (direction) and forward (pitch for approach/retreat)
     yaw_pid: PIDGains = field(default_factory=lambda: PIDGains(
@@ -62,6 +60,11 @@ class PipelineConfig:
     # Rate limiting — max RC units change per second
     max_rc_rate: float = 200.0
 
+    # RC trigger — AUX channel to start/stop tracking
+    track_aux_ch: int = 4           # 0-indexed (AUX1 = 4)
+    track_aux_threshold: int = 1500  # above this = tracking active
+    track_bbox_size: int = 100       # fixed bbox size in pixels
+
     # GCS
     gcs_host: str = "192.168.1.100"
     gcs_port: int = 14550
@@ -81,12 +84,11 @@ class PipelineConfig:
 class TrackingPipeline:
     """Full pipeline: Camera -> Tracker -> Controller -> MSP + GCS.
 
-    Quick start::
+    Tracking is activated by an RC AUX switch (read via MSP_RC from the FC).
+    When the switch goes high, the tracker initializes with a centered bbox.
+    When it goes low, tracking stops and channels return to neutral.
 
-        pipeline = TrackingPipeline(PipelineConfig())
-        pipeline.start()
-        pipeline.init_target()
-        pipeline.run()
+    Alternatively, call init_target(bbox) before run() to skip RC trigger.
     """
 
     def __init__(self, config):
@@ -95,8 +97,7 @@ class TrackingPipeline:
         # Modules
         self.camera = CameraCapture(config.camera_source, config.frame_width,
                                     config.frame_height, config.camera_fps)
-        self.tracker = ObjectTracker(config.tracker_type, config.hsv_lower,
-                                     config.hsv_upper)
+        self.tracker = ObjectTracker(config.tracker_type)
         self.controller = FlightController(config)
         self.msp = MSPConnection(config.serial_port, config.baudrate)
         self.gcs = None
@@ -105,6 +106,8 @@ class TrackingPipeline:
                                config.gcs_listen_port, config.gcs_send_hz)
 
         self._running = False
+        self._tracking_active = False
+        self._rc_trigger_mode = True  # False if init_target() is called
         self._loop_fps = 0.0
 
     # ── lifecycle ─────────────────────────────────────────────────
@@ -124,6 +127,7 @@ class TrackingPipeline:
 
     def stop(self):
         self._running = False
+        self._tracking_active = False
         self.controller.reset()
         self.msp.send_rc(self.controller.channels)
         time.sleep(0.05)
@@ -137,8 +141,8 @@ class TrackingPipeline:
 
     # ── target initialization ─────────────────────────────────────
 
-    def init_target(self, bbox=None):
-        """Initialize the tracker. If bbox is None, opens interactive ROI."""
+    def init_target(self, bbox):
+        """Pre-initialize tracker with a known bbox. Disables RC trigger."""
         frame = None
         for _ in range(30):
             frame = self.camera.read()
@@ -148,9 +152,35 @@ class TrackingPipeline:
         if frame is None:
             raise RuntimeError("No frame available from camera")
 
-        if bbox is None:
-            bbox = self.tracker.select_roi(frame)
         self.tracker.init(frame, bbox)
+        self._tracking_active = True
+        self._rc_trigger_mode = False
+
+    # ── RC trigger ────────────────────────────────────────────────
+
+    def _poll_rc_trigger(self, frame):
+        """Read AUX channel from FC and start/stop tracking."""
+        rc = self.msp.get_rc_channels()
+        if rc is None or len(rc) <= self.cfg.track_aux_ch:
+            return
+
+        aux_active = rc[self.cfg.track_aux_ch] > self.cfg.track_aux_threshold
+
+        if aux_active and not self._tracking_active:
+            # Start tracking — centered bbox
+            s = self.cfg.track_bbox_size
+            x = self.cfg.frame_width // 2 - s // 2
+            y = self.cfg.frame_height // 2 - s // 2
+            self.tracker.init(frame, (x, y, s, s))
+            self._tracking_active = True
+            logger.info("RC trigger: tracking started (bbox=%dx%d at center)", s, s)
+
+        elif not aux_active and self._tracking_active:
+            # Stop tracking
+            self.tracker.reset()
+            self.controller.reset()
+            self._tracking_active = False
+            logger.info("RC trigger: tracking stopped")
 
     # ── main loop ─────────────────────────────────────────────────
 
@@ -169,8 +199,15 @@ class TrackingPipeline:
                     time.sleep(0.001)
                     continue
 
+                # Check RC trigger
+                if self._rc_trigger_mode:
+                    self._poll_rc_trigger(frame)
+
                 # Track
-                result = self.tracker.update(frame)
+                if self._tracking_active:
+                    result = self.tracker.update(frame)
+                else:
+                    result = TrackResult()
 
                 # Control
                 self.controller.update(result)

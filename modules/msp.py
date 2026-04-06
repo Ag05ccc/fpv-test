@@ -80,6 +80,14 @@ class MSPConnection:
                 return None
             return rest[:size]
 
+    def get_rc_channels(self):
+        """Read current RC channel values from FC via MSP_RC."""
+        data = self.request(MSPCode.MSP_RC)
+        if data is None or len(data) < 2:
+            return None
+        n = len(data) // 2
+        return list(struct.unpack("<%dH" % n, data[:n * 2]))
+
     def get_attitude(self):
         """Request MSP_ATTITUDE and return roll/pitch/yaw in degrees."""
         data = self.request(MSPCode.MSP_ATTITUDE)
