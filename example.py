@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Example: run the tracking pipeline.
+Example: run the tracking pipeline with two-stage AUX arming.
+
+  AUX1 (--arm-ch)   = arm pipeline (start camera, systems ready)
+  AUX2 (--track-ch) = start tracking (send RC override)
 
 Usage:
-    # RC trigger mode (default) — flip AUX switch to start tracking:
-    python example.py
+    # Default: AUX1=ch4, AUX2=ch5
+    python example.py --port /dev/ttyAMA0
 
-    # Pre-set bbox (skip RC trigger, useful for testing):
-    python example.py --bbox 270 190 100 100
+    # Custom AUX channels and bbox size
+    python example.py --arm-ch 4 --track-ch 5 --track-size 120
 
-    # With GCS telemetry:
+    # With GCS telemetry
     python example.py --gcs-host 192.168.1.100
+
+    # Disable GCS
+    python example.py --no-gcs
 """
 
 import argparse
@@ -22,12 +28,12 @@ def main():
     ap.add_argument("--port", default="/dev/ttyAMA0", help="FC serial port")
     ap.add_argument("--camera", default=0, type=int, help="Camera index")
     ap.add_argument("--tracker", default="CSRT", choices=["CSRT", "KCF"])
-    ap.add_argument("--bbox", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
-                    help="Pre-set bounding box (disables RC trigger)")
-    ap.add_argument("--track-ch", default=4, type=int,
-                    help="AUX channel index for tracking trigger (0-indexed, default=4)")
+    ap.add_argument("--arm-ch", default=4, type=int,
+                    help="AUX channel to arm pipeline (0-indexed, default=4)")
+    ap.add_argument("--track-ch", default=5, type=int,
+                    help="AUX channel to start tracking (0-indexed, default=5)")
     ap.add_argument("--track-size", default=100, type=int,
-                    help="Fixed bbox size in pixels for RC trigger init")
+                    help="Fixed bbox size in pixels for tracker init")
     ap.add_argument("--loop-hz", default=30, type=int)
     ap.add_argument("--show-preview", action="store_true", help="Show GUI preview")
     ap.add_argument("--gcs-host", default="192.168.1.100", help="GCS IP address")
@@ -41,6 +47,7 @@ def main():
         tracker_type=args.tracker,
         loop_hz=args.loop_hz,
         show_preview=args.show_preview,
+        arm_aux_ch=args.arm_ch,
         track_aux_ch=args.track_ch,
         track_bbox_size=args.track_size,
         gcs_host=args.gcs_host,
@@ -53,12 +60,10 @@ def main():
     pipeline = TrackingPipeline(cfg)
     pipeline.start()
 
-    if args.bbox:
-        pipeline.init_target(bbox=tuple(args.bbox))
-        print("Tracking started with preset bbox. Press Ctrl+C to stop.")
-    else:
-        print("Waiting for RC trigger on channel %d. Press Ctrl+C to stop." % args.track_ch)
-
+    print("Pipeline running.")
+    print("  AUX ch%d = arm (start camera)" % args.arm_ch)
+    print("  AUX ch%d = track (start tracking)" % args.track_ch)
+    print("Press Ctrl+C to stop.")
     pipeline.run()
 
 

@@ -1,5 +1,12 @@
 """
 pipeline - Ties all modules together into the main tracking loop.
+
+Two-stage AUX arming:
+  AUX1 (arm)   -> starts camera, systems ready, pilot keeps full control
+  AUX2 (track) -> starts tracker, Pi sends MSP_SET_RAW_RC (overrides control)
+
+When either AUX goes low, Pi stops sending RC -> real receiver takes over.
+Requires Betaflight MSP Override feature + a real RC receiver on the FC.
 """
 
 import time
@@ -16,6 +23,12 @@ from .msp import MSPConnection
 from .gcs import GCSLink, TelemetryPacket
 
 logger = logging.getLogger(__name__)
+
+
+# Pipeline states
+IDLE = 0       # monitoring AUX, not sending RC, pilot has full control
+ARMED = 1      # camera running, systems ready, not sending RC
+TRACKING = 2   # tracker active, sending MSP_SET_RAW_RC
 
 
 @dataclass
@@ -60,10 +73,11 @@ class PipelineConfig:
     # Rate limiting — max RC units change per second
     max_rc_rate: float = 200.0
 
-    # RC trigger — AUX channel to start/stop tracking
-    track_aux_ch: int = 4           # 0-indexed (AUX1 = 4)
-    track_aux_threshold: int = 1500  # above this = tracking active
-    track_bbox_size: int = 100       # fixed bbox size in pixels
+    # Two-stage AUX arming (0-indexed channel numbers)
+    arm_aux_ch: int = 4          # AUX1 — arm pipeline
+    track_aux_ch: int = 5        # AUX2 — start tracking
+    aux_threshold: int = 1500    # above this = switch active
+    track_bbox_size: int = 100   # fixed bbox size in pixels
 
     # GCS
     gcs_host: str = "192.168.1.100"
@@ -82,19 +96,21 @@ class PipelineConfig:
 
 
 class TrackingPipeline:
-    """Full pipeline: Camera -> Tracker -> Controller -> MSP + GCS.
+    """Two-stage armed tracking pipeline.
 
-    Tracking is activated by an RC AUX switch (read via MSP_RC from the FC).
-    When the switch goes high, the tracker initializes with a centered bbox.
-    When it goes low, tracking stops and channels return to neutral.
+    States:
+        IDLE     — monitoring AUX channels, not sending RC, pilot flies normally
+        ARMED    — camera running, systems ready, still not sending RC
+        TRACKING — tracker active, Pi sends MSP_SET_RAW_RC via MSP Override
 
-    Alternatively, call init_target(bbox) before run() to skip RC trigger.
+    When Pi stops sending RC (TRACKING -> ARMED or IDLE), the real RC
+    receiver takes over immediately. No failsafe.
     """
 
     def __init__(self, config):
         self.cfg = config
 
-        # Modules
+        # Modules (created but not started yet)
         self.camera = CameraCapture(config.camera_source, config.frame_width,
                                     config.frame_height, config.camera_fps)
         self.tracker = ObjectTracker(config.tracker_type)
@@ -105,15 +121,19 @@ class TrackingPipeline:
             self.gcs = GCSLink(config.gcs_host, config.gcs_port,
                                config.gcs_listen_port, config.gcs_send_hz)
 
+        self._state = IDLE
         self._running = False
-        self._tracking_active = False
-        self._rc_trigger_mode = True  # False if init_target() is called
+        self._camera_started = False
         self._loop_fps = 0.0
+
+    @property
+    def state_name(self):
+        return {IDLE: "IDLE", ARMED: "ARMED", TRACKING: "TRACKING"}[self._state]
 
     # ── lifecycle ─────────────────────────────────────────────────
 
     def start(self):
-        self.camera.start()
+        """Connect MSP (and GCS). Camera starts when pipeline is armed."""
         try:
             self.msp.connect()
         except serial.SerialException as e:
@@ -127,11 +147,7 @@ class TrackingPipeline:
 
     def stop(self):
         self._running = False
-        self._tracking_active = False
-        self.controller.reset()
-        self.msp.send_rc(self.controller.channels)
-        time.sleep(0.05)
-        self.camera.stop()
+        self._transition_to(IDLE)
         self.msp.disconnect()
         if self.gcs:
             self.gcs.disconnect()
@@ -139,48 +155,72 @@ class TrackingPipeline:
             cv2.destroyAllWindows()
         logger.info("Pipeline stopped")
 
-    # ── target initialization ─────────────────────────────────────
+    # ── state transitions ─────────────────────────────────────────
 
-    def init_target(self, bbox):
-        """Pre-initialize tracker with a known bbox. Disables RC trigger."""
-        frame = None
-        for _ in range(30):
-            frame = self.camera.read()
-            if frame is not None:
-                break
-            time.sleep(0.05)
-        if frame is None:
-            raise RuntimeError("No frame available from camera")
-
-        self.tracker.init(frame, bbox)
-        self._tracking_active = True
-        self._rc_trigger_mode = False
-
-    # ── RC trigger ────────────────────────────────────────────────
-
-    def _poll_rc_trigger(self, frame):
-        """Read AUX channel from FC and start/stop tracking."""
-        rc = self.msp.get_rc_channels()
-        if rc is None or len(rc) <= self.cfg.track_aux_ch:
+    def _transition_to(self, new_state):
+        old = self._state
+        if new_state == old:
             return
 
-        aux_active = rc[self.cfg.track_aux_ch] > self.cfg.track_aux_threshold
-
-        if aux_active and not self._tracking_active:
-            # Start tracking — centered bbox
-            s = self.cfg.track_bbox_size
-            x = self.cfg.frame_width // 2 - s // 2
-            y = self.cfg.frame_height // 2 - s // 2
-            self.tracker.init(frame, (x, y, s, s))
-            self._tracking_active = True
-            logger.info("RC trigger: tracking started (bbox=%dx%d at center)", s, s)
-
-        elif not aux_active and self._tracking_active:
-            # Stop tracking
+        # Leaving TRACKING -> stop sending RC, real receiver takes over
+        if old == TRACKING:
             self.tracker.reset()
             self.controller.reset()
-            self._tracking_active = False
-            logger.info("RC trigger: tracking stopped")
+            logger.info("TRACKING -> %s: RC override stopped, pilot has control",
+                        {ARMED: "ARMED", IDLE: "IDLE"}[new_state])
+
+        # Leaving ARMED -> stop camera
+        if old >= ARMED and new_state == IDLE:
+            if self._camera_started:
+                self.camera.stop()
+                self._camera_started = False
+            logger.info("ARMED -> IDLE: camera stopped")
+
+        # Entering ARMED -> start camera
+        if new_state >= ARMED and not self._camera_started:
+            self.camera.start()
+            self._camera_started = True
+            logger.info("IDLE -> ARMED: camera started, ready to track")
+
+        # Entering TRACKING -> init tracker with centered bbox
+        if new_state == TRACKING:
+            frame = self.camera.read()
+            if frame is not None:
+                s = self.cfg.track_bbox_size
+                x = self.cfg.frame_width // 2 - s // 2
+                y = self.cfg.frame_height // 2 - s // 2
+                self.tracker.init(frame, (x, y, s, s))
+                logger.info("ARMED -> TRACKING: tracker started (%dx%d at center)", s, s)
+            else:
+                logger.warning("No frame available, cannot start tracking")
+                return  # stay in ARMED
+
+        self._state = new_state
+
+    def _poll_aux_state(self):
+        """Read AUX channels from FC and update pipeline state."""
+        rc = self.msp.get_rc_channels()
+        if rc is None:
+            return
+
+        min_ch = max(self.cfg.arm_aux_ch, self.cfg.track_aux_ch)
+        if len(rc) <= min_ch:
+            return
+
+        arm_active = rc[self.cfg.arm_aux_ch] > self.cfg.aux_threshold
+        track_active = rc[self.cfg.track_aux_ch] > self.cfg.aux_threshold
+
+        if not arm_active:
+            # AUX1 off -> everything off
+            self._transition_to(IDLE)
+        elif arm_active and track_active:
+            # Both on -> tracking (arm first if needed)
+            if self._state == IDLE:
+                self._transition_to(ARMED)
+            self._transition_to(TRACKING)
+        elif arm_active and not track_active:
+            # Only AUX1 -> armed but not tracking
+            self._transition_to(ARMED)
 
     # ── main loop ─────────────────────────────────────────────────
 
@@ -188,32 +228,36 @@ class TrackingPipeline:
         """Blocking control loop. Ctrl-C or stop() to exit."""
         self._running = True
         period = 1.0 / self.cfg.loop_hz
-        logger.info("Control loop running @ %d Hz", self.cfg.loop_hz)
+        logger.info("Pipeline running, waiting for AUX arm signal...")
 
         try:
             while self._running:
                 t_start = time.monotonic()
 
+                # Always poll AUX state
+                self._poll_aux_state()
+
+                if self._state == IDLE:
+                    # Nothing to do, just wait
+                    time.sleep(period)
+                    continue
+
+                # ARMED or TRACKING — camera is running
                 frame = self.camera.read()
                 if frame is None:
                     time.sleep(0.001)
                     continue
 
-                # Check RC trigger
-                if self._rc_trigger_mode:
-                    self._poll_rc_trigger(frame)
-
-                # Track
-                if self._tracking_active:
+                if self._state == TRACKING:
+                    # Track + control + send RC
                     result = self.tracker.update(frame)
+                    self.controller.update(result)
+                    self.msp.send_rc(self.controller.channels)
                 else:
+                    # ARMED — camera running but not sending RC
                     result = TrackResult()
 
-                # Control
-                self.controller.update(result)
-                self.msp.send_rc(self.controller.channels)
-
-                # GCS telemetry
+                # GCS telemetry (send in both ARMED and TRACKING)
                 if self.gcs:
                     self._send_telemetry(result)
                     self._handle_gcs_commands()
@@ -285,6 +329,9 @@ class TrackingPipeline:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.circle(frame, (int(result.center[0]), int(result.center[1])),
                        5, (0, 0, 255), -1)
+        # Show state
+        cv2.putText(frame, self.state_name, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         cv2.imshow("Drone Tracker", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             self._running = False

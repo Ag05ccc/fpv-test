@@ -10,6 +10,59 @@ USB Camera -> CameraCapture (threaded) -> ObjectTracker (CSRT/KCF)
     -> GCSLink (UDP telemetry) -> Ground Control Station (Ethernet)
 ```
 
+## Two-Stage AUX Arming
+
+Tracking uses two AUX switches on your RC transmitter:
+
+```
+AUX1 off             AUX1 on              AUX2 on
+┌──────────┐     ┌──────────────┐     ┌─────────────────┐
+│   IDLE   │ --> │    ARMED     │ --> │   TRACKING      │
+│          │ <-- │  camera on   │ <-- │  sending RC     │
+└──────────┘     │  ready       │     │  PID active     │
+ pilot flies     └──────────────┘     └─────────────────┘
+ normally         pilot flies          Pi overrides
+                  normally             roll/pitch/yaw
+```
+
+- **IDLE**: Pi only reads AUX channels. Not sending RC. Pilot has full control.
+- **ARMED**: Camera started, systems ready. Still not sending RC. Pilot has full control.
+- **TRACKING**: Tracker active, Pi sends MSP_SET_RAW_RC. Pi controls the drone.
+
+When any AUX switch goes low, Pi **stops sending RC** and the real receiver
+takes over immediately. No failsafe.
+
+## Betaflight Setup
+
+You need a **real RC receiver** on the FC for normal flying, plus **MSP Override**
+so the Pi can take over specific channels when tracking.
+
+### 1. Ports tab
+Enable MSP on the UART connected to your companion board (Pi / Jetson).
+
+### 2. Enable MSP Override (Betaflight CLI)
+```
+# Enable the MSP override feature
+feature MSP_OVERRIDE
+
+# Override channels 0-3 (roll, pitch, throttle, yaw) — bitmask 15
+set msp_override_channels = 15
+
+save
+```
+
+### 3. Assign AUX switches (Modes tab)
+- Assign **ANGLE** mode to an AUX switch (for stable autonomous flight)
+- Assign **MSP OVERRIDE** mode to the same AUX2 switch you use for tracking
+  (so MSP Override is only active when tracking is active)
+
+### 4. How it works
+- Real receiver handles all normal flying (angle, acro, horizon, etc.)
+- When AUX2 is flipped: Betaflight enables MSP Override on the configured channels
+- Pi sends MSP_SET_RAW_RC which overrides roll/pitch/yaw/throttle
+- When AUX2 goes low: MSP Override disabled, real receiver values used instantly
+- Real receiver is always connected, so **no failsafe**
+
 ## Project Structure
 
 ```
@@ -20,7 +73,7 @@ modules/
   controller.py     - PID controllers + rate-limited flight control
   msp.py            - MSPv1 serial protocol for Betaflight
   gcs.py            - UDP telemetry to ground control station
-  pipeline.py       - Orchestrates all modules in a control loop
+  pipeline.py       - Two-stage state machine + control loop
 example.py          - CLI entry point
 ```
 
@@ -30,32 +83,6 @@ example.py          - CLI entry point
 - **Pitch**: target bbox width vs desired width -> fly forward/backward
 - **Roll**: clamped to +/-20 degrees (Betaflight angle mode)
 - **Rate limiter**: smooth channel transitions, prevents sudden attitude changes
-
-## Tracker Initialization
-
-Tracking is started via an **RC AUX switch** read from the FC over MSP:
-
-1. Pilot flips AUX switch (e.g. AUX1, channel index 4)
-2. Pipeline reads the channel value via MSP_RC
-3. When above threshold (default 1500), tracker initializes with a fixed-size
-   bbox centered in the frame
-4. When switch goes low, tracking stops and channels return to neutral
-
-Alternatively, pass `--bbox X Y W H` to skip RC trigger and start immediately.
-
-## Betaflight Setup
-
-1. Enable MSP on the UART connected to your companion board (Configurator -> Ports tab).
-2. Enable angle mode via an AUX switch or always-on:
-   ```
-   aux 0 1 0 900 2100 0 0
-   save
-   ```
-3. If using MSP as the sole RC source (no physical receiver):
-   ```
-   set serialrx_provider = MSP
-   save
-   ```
 
 ## Hardware Wiring
 
@@ -74,14 +101,11 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```bash
-# RC trigger mode (default) — flip AUX switch to start tracking
+# Default: AUX1=ch4 (arm), AUX2=ch5 (track)
 python example.py --port /dev/ttyAMA0
 
-# Pre-set bbox (skip RC trigger)
-python example.py --bbox 270 190 100 100
-
-# Custom AUX channel and bbox size
-python example.py --track-ch 5 --track-size 120
+# Custom AUX channels and bbox size
+python example.py --arm-ch 4 --track-ch 5 --track-size 120
 
 # With GCS telemetry
 python example.py --gcs-host 192.168.1.100
@@ -107,4 +131,4 @@ Start with low gains and increase gradually:
 | `FlightController`  | `controller.py` | Converts tracking to RC channels          |
 | `MSPConnection`     | `msp.py`        | Serial MSP protocol to Betaflight         |
 | `GCSLink`           | `gcs.py`        | UDP telemetry + command receiver          |
-| `TrackingPipeline`  | `pipeline.py`   | Orchestrates everything in a control loop |
+| `TrackingPipeline`  | `pipeline.py`   | Two-stage state machine + control loop    |
