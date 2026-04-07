@@ -124,6 +124,7 @@ class TrackingPipeline:
         self._state = IDLE
         self._running = False
         self._camera_started = False
+        self._msp_connected = False
         self._loop_fps = 0.0
         self._last_rc = None
         self._debug_counter = 0
@@ -138,8 +139,10 @@ class TrackingPipeline:
         """Connect MSP (and GCS). Camera starts when pipeline is armed."""
         try:
             self.msp.connect()
+            self._msp_connected = True
         except serial.SerialException as e:
-            logger.warning("MSP serial failed (%s); running in dry-run mode", e)
+            logger.warning("MSP serial failed (%s); running in preview-only mode", e)
+            self._msp_connected = False
         if self.gcs:
             try:
                 self.gcs.connect()
@@ -264,21 +267,32 @@ class TrackingPipeline:
         """Blocking control loop. Ctrl-C or stop() to exit."""
         self._running = True
         period = 1.0 / self.cfg.loop_hz
-        logger.info("Pipeline running, waiting for AUX arm signal...")
+
+        # No MSP -> preview-only mode (for testing with video files)
+        if not self._msp_connected:
+            if not self._camera_started:
+                self.camera.start()
+                self._camera_started = True
+            self.cfg.show_preview = True
+            logger.info("Preview-only mode (no MSP). Press 'q' to quit.")
+
+        else:
+            logger.info("Pipeline running, waiting for AUX arm signal...")
 
         try:
             while self._running:
                 t_start = time.monotonic()
 
-                # Always poll AUX state
-                self._poll_aux_state()
+                # Poll AUX state (only if MSP connected)
+                if self._msp_connected:
+                    self._poll_aux_state()
 
-                if self._state == IDLE:
-                    self._debug_print(TrackResult())
-                    time.sleep(period)
-                    continue
+                    if self._state == IDLE:
+                        self._debug_print(TrackResult())
+                        time.sleep(period)
+                        continue
 
-                # AI_ARMED or TRACKING — camera is running
+                # Camera must be running to get frames
                 frame = self.camera.read()
                 if frame is None:
                     time.sleep(0.001)
@@ -290,7 +304,6 @@ class TrackingPipeline:
                     self.controller.update(result)
                     self.msp.send_rc(self.controller.channels)
                 else:
-                    # AI_ARMED — camera running but not sending RC
                     result = TrackResult()
 
                 # GCS telemetry (send in both AI_ARMED and TRACKING)
