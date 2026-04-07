@@ -20,6 +20,7 @@ class CameraCapture:
         self.width = width
         self.height = height
         self.fps = fps
+        self._is_video = isinstance(source, str)
         self._cap = None
         self._frame = None
         self._lock = threading.Lock()
@@ -44,7 +45,11 @@ class CameraCapture:
             if ok:
                 with self._lock:
                     self._frame = frame
-            cv2.waitKey(1)
+            elif self._is_video:
+                # Video ended — loop back to start
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if self._is_video:
+                cv2.waitKey(1)
 
     def read(self):
         with self._lock:
