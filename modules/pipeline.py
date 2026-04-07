@@ -361,16 +361,52 @@ class TrackingPipeline:
     def _draw_preview(self, frame, result):
         cx = int(self.cfg.frame_width / 2)
         cy = int(self.cfg.frame_height / 2)
+
+        # Frame center crosshair
         cv2.drawMarker(frame, (cx, cy), (0, 255, 0),
                        cv2.MARKER_CROSS, 20, 2)
+
+        # Init bbox region (where tracker would start)
+        s = self.cfg.track_bbox_size
+        ix = cx - s // 2
+        iy = cy - s // 2
+        if self._state == AI_ARMED:
+            cv2.rectangle(frame, (ix, iy), (ix + s, iy + s), (0, 255, 255), 1)
+            cv2.putText(frame, "init zone", (ix, iy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+        # Tracked target
         if result.found:
             x, y, w, h = result.bbox
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.circle(frame, (int(result.center[0]), int(result.center[1])),
                        5, (0, 0, 255), -1)
-        # Show state
+            # Line from center to target
+            cv2.line(frame, (cx, cy),
+                     (int(result.center[0]), int(result.center[1])),
+                     (0, 0, 255), 1)
+            # Target width vs desired
+            cv2.putText(frame, "w:%d / %d" % (w, int(self.cfg.desired_target_width)),
+                        (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        elif self._state == TRACKING:
+            cv2.putText(frame, "TARGET LOST", (cx - 60, cy + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # State + info overlay
+        ctrl = self.controller
+        color = {IDLE: (128, 128, 128), AI_ARMED: (0, 255, 255),
+                 TRACKING: (0, 255, 0)}[self._state]
         cv2.putText(frame, self.state_name, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        cv2.putText(frame, "%.0f fps" % self._loop_fps, (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        if self._state == TRACKING:
+            cv2.putText(frame, "yaw: %.1f  fwd: %.1f" % (ctrl.yaw_error, ctrl.forward_error),
+                        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(frame, "yaw_out: %.0f  fwd_out: %.0f" % (ctrl.yaw_output, ctrl.forward_output),
+                        (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
         cv2.imshow("Drone Tracker", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             self._running = False
