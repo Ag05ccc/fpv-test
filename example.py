@@ -9,14 +9,17 @@ Usage:
     # Default: AUX1=ch4, AUX2=ch5
     python example.py --port /dev/ttyAMA0
 
-    # Custom AUX channels and bbox size
-    python example.py --arm-ch 4 --track-ch 5 --track-size 120
+    # Custom AUX channel and bbox size
+    python example.py --aux-ch 4 --track-size 120
 
     # With GCS telemetry
     python example.py --gcs-host 192.168.1.100
 
     # Disable GCS
     python example.py --no-gcs
+
+    # Test with a video file instead of a camera
+    python example.py --camera test_video.mp4 --no-gcs
 """
 
 import argparse
@@ -26,12 +29,11 @@ from modules import PipelineConfig, TrackingPipeline, PIDGains
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="/dev/ttyAMA0", help="FC serial port")
-    ap.add_argument("--camera", default=0, type=int, help="Camera index")
+    ap.add_argument("--camera", default="0",
+                    help="Camera index (0,1,...) or video file path")
     ap.add_argument("--tracker", default="CSRT", choices=["CSRT", "KCF"])
-    ap.add_argument("--arm-ch", default=4, type=int,
-                    help="AUX channel to arm pipeline (0-indexed, default=4)")
-    ap.add_argument("--track-ch", default=5, type=int,
-                    help="AUX channel to start tracking (0-indexed, default=5)")
+    ap.add_argument("--aux-ch", default=7, type=int,
+                    help="3-position AUX channel (0-indexed, default=7 / AUX4)")
     ap.add_argument("--track-size", default=100, type=int,
                     help="Fixed bbox size in pixels for tracker init")
     ap.add_argument("--loop-hz", default=30, type=int)
@@ -41,14 +43,16 @@ def main():
     ap.add_argument("--no-gcs", action="store_true", help="Disable GCS link")
     args = ap.parse_args()
 
+    # Use int for camera index, string for video file
+    cam = int(args.camera) if args.camera.isdigit() else args.camera
+
     cfg = PipelineConfig(
-        camera_source=args.camera,
+        camera_source=cam,
         serial_port=args.port,
         tracker_type=args.tracker,
         loop_hz=args.loop_hz,
         show_preview=args.show_preview,
-        arm_aux_ch=args.arm_ch,
-        track_aux_ch=args.track_ch,
+        aux_ch=args.aux_ch,
         track_bbox_size=args.track_size,
         gcs_host=args.gcs_host,
         gcs_port=args.gcs_port,
@@ -60,9 +64,10 @@ def main():
     pipeline = TrackingPipeline(cfg)
     pipeline.start()
 
-    print("Pipeline running.")
-    print("  AUX ch%d = arm (start camera)" % args.arm_ch)
-    print("  AUX ch%d = track (start tracking)" % args.track_ch)
+    print("Pipeline running. AUX ch%d (3-position):" % args.aux_ch)
+    print("  Low  = IDLE      (pilot control)")
+    print("  Mid  = AI-ARMED  (camera ready)")
+    print("  High = TRACKING  (Pi override)")
     print("Press Ctrl+C to stop.")
     pipeline.run()
 

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Pipeline states
 IDLE = 0       # monitoring AUX, not sending RC, pilot has full control
-ARMED = 1      # camera running, systems ready, not sending RC
+AI_ARMED = 1      # camera running, systems ready, not sending RC
 TRACKING = 2   # tracker active, sending MSP_SET_RAW_RC
 
 
@@ -73,11 +73,11 @@ class PipelineConfig:
     # Rate limiting — max RC units change per second
     max_rc_rate: float = 200.0
 
-    # Two-stage AUX arming (0-indexed channel numbers)
-    arm_aux_ch: int = 4          # AUX1 — arm pipeline
-    track_aux_ch: int = 5        # AUX2 — start tracking
-    aux_threshold: int = 1500    # above this = switch active
-    track_bbox_size: int = 100   # fixed bbox size in pixels
+    # AUX arming — single 3-position switch (0-indexed channel)
+    aux_ch: int = 7              # AUX4 channel (3-position switch)
+    aux_arm_threshold: int = 1300    # above this = AI_ARMED
+    aux_track_threshold: int = 1700  # above this = TRACKING
+    track_bbox_size: int = 100       # fixed bbox size in pixels
 
     # GCS
     gcs_host: str = "192.168.1.100"
@@ -100,10 +100,10 @@ class TrackingPipeline:
 
     States:
         IDLE     — monitoring AUX channels, not sending RC, pilot flies normally
-        ARMED    — camera running, systems ready, still not sending RC
+        AI_ARMED    — camera running, systems ready, still not sending RC
         TRACKING — tracker active, Pi sends MSP_SET_RAW_RC via MSP Override
 
-    When Pi stops sending RC (TRACKING -> ARMED or IDLE), the real RC
+    When Pi stops sending RC (TRACKING -> AI_ARMED or IDLE), the real RC
     receiver takes over immediately. No failsafe.
     """
 
@@ -125,10 +125,12 @@ class TrackingPipeline:
         self._running = False
         self._camera_started = False
         self._loop_fps = 0.0
+        self._last_rc = None
+        self._debug_counter = 0
 
     @property
     def state_name(self):
-        return {IDLE: "IDLE", ARMED: "ARMED", TRACKING: "TRACKING"}[self._state]
+        return {IDLE: "IDLE", AI_ARMED: "AI-ARMED", TRACKING: "TRACKING"}[self._state]
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -167,20 +169,20 @@ class TrackingPipeline:
             self.tracker.reset()
             self.controller.reset()
             logger.info("TRACKING -> %s: RC override stopped, pilot has control",
-                        {ARMED: "ARMED", IDLE: "IDLE"}[new_state])
+                        {AI_ARMED: "AI-ARMED", IDLE: "IDLE"}[new_state])
 
-        # Leaving ARMED -> stop camera
-        if old >= ARMED and new_state == IDLE:
+        # Leaving AI_ARMED -> stop camera
+        if old >= AI_ARMED and new_state == IDLE:
             if self._camera_started:
                 self.camera.stop()
                 self._camera_started = False
-            logger.info("ARMED -> IDLE: camera stopped")
+            logger.info("AI_ARMED -> IDLE: camera stopped")
 
-        # Entering ARMED -> start camera
-        if new_state >= ARMED and not self._camera_started:
+        # Entering AI_ARMED -> start camera
+        if new_state >= AI_ARMED and not self._camera_started:
             self.camera.start()
             self._camera_started = True
-            logger.info("IDLE -> ARMED: camera started, ready to track")
+            logger.info("IDLE -> AI_ARMED: camera started, ready to track")
 
         # Entering TRACKING -> init tracker with centered bbox
         if new_state == TRACKING:
@@ -190,37 +192,71 @@ class TrackingPipeline:
                 x = self.cfg.frame_width // 2 - s // 2
                 y = self.cfg.frame_height // 2 - s // 2
                 self.tracker.init(frame, (x, y, s, s))
-                logger.info("ARMED -> TRACKING: tracker started (%dx%d at center)", s, s)
+                logger.info("AI_ARMED -> TRACKING: tracker started (%dx%d at center)", s, s)
             else:
                 logger.warning("No frame available, cannot start tracking")
-                return  # stay in ARMED
+                return  # stay in AI_ARMED
 
         self._state = new_state
 
     def _poll_aux_state(self):
-        """Read AUX channels from FC and update pipeline state."""
+        """Read 3-position AUX switch from FC and update pipeline state.
+
+        Low  (~1000) = IDLE
+        Mid  (~1500) = AI_ARMED
+        High (~2000) = TRACKING
+        """
         rc = self.msp.get_rc_channels()
         if rc is None:
             return
 
-        min_ch = max(self.cfg.arm_aux_ch, self.cfg.track_aux_ch)
-        if len(rc) <= min_ch:
+        self._last_rc = rc
+
+        if len(rc) <= self.cfg.aux_ch:
             return
 
-        arm_active = rc[self.cfg.arm_aux_ch] > self.cfg.aux_threshold
-        track_active = rc[self.cfg.track_aux_ch] > self.cfg.aux_threshold
+        val = rc[self.cfg.aux_ch]
 
-        if not arm_active:
-            # AUX1 off -> everything off
-            self._transition_to(IDLE)
-        elif arm_active and track_active:
-            # Both on -> tracking (arm first if needed)
+        if val > self.cfg.aux_track_threshold:
             if self._state == IDLE:
-                self._transition_to(ARMED)
+                self._transition_to(AI_ARMED)
             self._transition_to(TRACKING)
-        elif arm_active and not track_active:
-            # Only AUX1 -> armed but not tracking
-            self._transition_to(ARMED)
+        elif val > self.cfg.aux_arm_threshold:
+            self._transition_to(AI_ARMED)
+        else:
+            self._transition_to(IDLE)
+
+    # ── debug output ──────────────────────────────────────────────
+
+    def _debug_print(self, result):
+        """Print a status line every ~1 second (every loop_hz frames)."""
+        self._debug_counter += 1
+        if self._debug_counter < self.cfg.loop_hz:
+            return
+        self._debug_counter = 0
+
+        rc = self._last_rc
+        aux_val = rc[self.cfg.aux_ch] if rc and len(rc) > self.cfg.aux_ch else 0
+
+        # RC sticks: roll, pitch, throttle, yaw
+        if rc and len(rc) >= 4:
+            sticks = "R:%d P:%d T:%d Y:%d" % (rc[0], rc[1], rc[2], rc[3])
+        else:
+            sticks = "no RC data"
+
+        ctrl = self.controller
+        line = "[%s] AUX4:%d | %s" % (self.state_name, aux_val, sticks)
+
+        if self._state == TRACKING:
+            line += " | found=%s yaw_err=%.1f fwd_err=%.1f ch=[%s]" % (
+                result.found,
+                ctrl.yaw_error,
+                ctrl.forward_error,
+                ",".join(str(c) for c in ctrl.channels),
+            )
+
+        line += " | %.1f fps" % self._loop_fps
+        print(line)
 
     # ── main loop ─────────────────────────────────────────────────
 
@@ -238,11 +274,11 @@ class TrackingPipeline:
                 self._poll_aux_state()
 
                 if self._state == IDLE:
-                    # Nothing to do, just wait
+                    self._debug_print(TrackResult())
                     time.sleep(period)
                     continue
 
-                # ARMED or TRACKING — camera is running
+                # AI_ARMED or TRACKING — camera is running
                 frame = self.camera.read()
                 if frame is None:
                     time.sleep(0.001)
@@ -254,10 +290,10 @@ class TrackingPipeline:
                     self.controller.update(result)
                     self.msp.send_rc(self.controller.channels)
                 else:
-                    # ARMED — camera running but not sending RC
+                    # AI_ARMED — camera running but not sending RC
                     result = TrackResult()
 
-                # GCS telemetry (send in both ARMED and TRACKING)
+                # GCS telemetry (send in both AI_ARMED and TRACKING)
                 if self.gcs:
                     self._send_telemetry(result)
                     self._handle_gcs_commands()
@@ -265,6 +301,9 @@ class TrackingPipeline:
                 # Preview
                 if self.cfg.show_preview:
                     self._draw_preview(frame, result)
+
+                # Debug
+                self._debug_print(result)
 
                 # Timing
                 elapsed = time.monotonic() - t_start
