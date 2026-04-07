@@ -44,6 +44,7 @@ class CameraCapture:
             if ok:
                 with self._lock:
                     self._frame = frame
+            cv2.waitKey(1)
 
     def read(self):
         with self._lock:
