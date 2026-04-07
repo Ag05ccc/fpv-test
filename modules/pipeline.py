@@ -282,43 +282,36 @@ class TrackingPipeline:
         try:
             while self._running:
                 t_start = time.monotonic()
+                result = TrackResult()
+                frame = None
 
                 # Poll AUX state (only if MSP connected)
                 if self._msp_connected:
                     self._poll_aux_state()
 
-                    if self._state == IDLE:
-                        self._debug_print(TrackResult())
-                        time.sleep(period)
-                        continue
+                # Get frame if camera is running
+                if self._camera_started:
+                    frame = self.camera.read()
 
-                # Camera must be running to get frames
-                frame = self.camera.read()
-                if frame is None:
-                    time.sleep(0.001)
-                    continue
-
-                if self._state == TRACKING:
+                if self._state == TRACKING and frame is not None:
                     # Track + control + send RC
                     result = self.tracker.update(frame)
                     self.controller.update(result)
                     self.msp.send_rc(self.controller.channels)
-                else:
-                    result = TrackResult()
 
-                # GCS telemetry (send in both AI_ARMED and TRACKING)
-                if self.gcs:
+                # GCS telemetry
+                if self.gcs and self._state >= AI_ARMED:
                     self._send_telemetry(result)
                     self._handle_gcs_commands()
 
-                # Preview
-                if self.cfg.show_preview:
+                # Preview — always show when enabled and we have a frame
+                if self.cfg.show_preview and frame is not None:
                     self._draw_preview(frame, result)
 
                 # Debug
                 self._debug_print(result)
 
-                # Timing
+                # Timing — enforce loop_hz
                 elapsed = time.monotonic() - t_start
                 self._loop_fps = 1.0 / elapsed if elapsed > 0 else 0.0
                 sleep_time = period - elapsed

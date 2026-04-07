@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--track-size", default=100, type=int,
                     help="Fixed bbox size in pixels for tracker init")
     ap.add_argument("--loop-hz", default=30, type=int)
-    ap.add_argument("--show-preview", action="store_true", help="Show GUI preview")
+    ap.add_argument("--headless", action="store_true", help="Disable GUI preview")
     ap.add_argument("--gcs-host", default="192.168.1.100", help="GCS IP address")
     ap.add_argument("--gcs-port", default=14550, type=int, help="GCS telemetry port")
     ap.add_argument("--no-gcs", action="store_true", help="Disable GCS link")
@@ -51,7 +51,7 @@ def main():
         serial_port=args.port,
         tracker_type=args.tracker,
         loop_hz=args.loop_hz,
-        show_preview=args.show_preview,
+        show_preview=not args.headless,
         aux_ch=args.aux_ch,
         track_bbox_size=args.track_size,
         gcs_host=args.gcs_host,
