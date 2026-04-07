@@ -191,10 +191,14 @@ class TrackingPipeline:
         if new_state == TRACKING:
             frame = self.camera.read()
             if frame is not None:
+                h_frame, w_frame = frame.shape[:2]
                 s = self.cfg.track_bbox_size
-                x = self.cfg.frame_width // 2 - s // 2
-                y = self.cfg.frame_height // 2 - s // 2
+                x = w_frame // 2 - s // 2
+                y = h_frame // 2 - s // 2
                 self.tracker.init(frame, (x, y, s, s))
+                # Update controller center to match actual frame
+                self.controller._cx = w_frame / 2.0
+                self.controller._cy = h_frame / 2.0
                 logger.info("AI_ARMED -> TRACKING: tracker started (%dx%d at center)", s, s)
             else:
                 logger.warning("No frame available, cannot start tracking")
@@ -368,8 +372,9 @@ class TrackingPipeline:
     # ── preview ───────────────────────────────────────────────────
 
     def _draw_preview(self, frame, result):
-        cx = int(self.cfg.frame_width / 2)
-        cy = int(self.cfg.frame_height / 2)
+        h_frame, w_frame = frame.shape[:2]
+        cx = w_frame // 2
+        cy = h_frame // 2
 
         # Frame center crosshair
         cv2.drawMarker(frame, (cx, cy), (0, 255, 0),
