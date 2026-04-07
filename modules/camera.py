@@ -2,6 +2,7 @@
 camera - Threaded video capture using OpenCV.
 """
 
+import time
 import threading
 import logging
 
@@ -40,16 +41,16 @@ class CameraCapture:
         logger.info("Camera started: %dx%d @ %dfps", self.width, self.height, self.fps)
 
     def _capture_loop(self):
+        delay = 1.0 / self.fps if self._is_video else 0
         while self._running:
             ok, frame = self._cap.read()
             if ok:
                 with self._lock:
                     self._frame = frame
             elif self._is_video:
-                # Video ended — loop back to start
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            if self._is_video:
-                cv2.waitKey(1)
+            if delay > 0:
+                time.sleep(delay)
 
     def read(self):
         with self._lock:

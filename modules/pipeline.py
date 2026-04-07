@@ -304,9 +304,12 @@ class TrackingPipeline:
                     self._send_telemetry(result)
                     self._handle_gcs_commands()
 
-                # Preview — always show when enabled and we have a frame
-                if self.cfg.show_preview and frame is not None:
-                    self._draw_preview(frame, result)
+                # Preview
+                if self.cfg.show_preview:
+                    if frame is not None:
+                        self._draw_preview(frame, result)
+                    else:
+                        cv2.waitKey(1)
 
                 # Debug
                 self._debug_print(result)
