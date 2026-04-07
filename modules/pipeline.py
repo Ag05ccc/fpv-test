@@ -189,7 +189,12 @@ class TrackingPipeline:
 
         # Entering TRACKING -> init tracker with centered bbox
         if new_state == TRACKING:
-            frame = self.camera.read()
+            frame = None
+            for _ in range(30):
+                frame = self.camera.read()
+                if frame is not None:
+                    break
+                time.sleep(0.05)
             if frame is not None:
                 h_frame, w_frame = frame.shape[:2]
                 s = self.cfg.track_bbox_size

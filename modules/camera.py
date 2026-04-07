@@ -62,4 +62,6 @@ class CameraCapture:
             self._thread.join(timeout=2.0)
         if self._cap:
             self._cap.release()
+        with self._lock:
+            self._frame = None
         logger.info("Camera stopped")
