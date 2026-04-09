@@ -96,15 +96,14 @@ class PipelineConfig:
 
 
 class TrackingPipeline:
-    """Two-stage armed tracking pipeline.
+    """Tracking pipeline. Camera and preview always run.
+    AUX switch only controls the tracker:
 
-    States:
-        IDLE     — monitoring AUX channels, not sending RC, pilot flies normally
-        AI_ARMED    — camera running, systems ready, still not sending RC
+        IDLE     — monitoring AUX, not sending RC, pilot flies normally
+        AI-ARMED — ready to track, still not sending RC
         TRACKING — tracker active, Pi sends MSP_SET_RAW_RC via MSP Override
 
-    When Pi stops sending RC (TRACKING -> AI_ARMED or IDLE), the real RC
-    receiver takes over immediately. No failsafe.
+    When Pi stops sending RC, real receiver takes over. No failsafe.
     """
 
     def __init__(self, config):
@@ -123,7 +122,6 @@ class TrackingPipeline:
 
         self._state = IDLE
         self._running = False
-        self._camera_started = False
         self._msp_connected = False
         self._loop_fps = 0.0
         self._last_rc = None
@@ -136,7 +134,8 @@ class TrackingPipeline:
     # ── lifecycle ─────────────────────────────────────────────────
 
     def start(self):
-        """Connect MSP (and GCS). Camera starts when pipeline is armed."""
+        """Start camera, connect MSP and GCS."""
+        self.camera.start()
         try:
             self.msp.connect()
             self._msp_connected = True
@@ -153,6 +152,7 @@ class TrackingPipeline:
     def stop(self):
         self._running = False
         self._transition_to(IDLE)
+        self.camera.stop()
         self.msp.disconnect()
         if self.gcs:
             self.gcs.disconnect()
@@ -172,20 +172,13 @@ class TrackingPipeline:
             self.tracker.reset()
             self.controller.reset()
             logger.info("TRACKING -> %s: RC override stopped, pilot has control",
-                        {AI_ARMED: "AI-ARMED", IDLE: "IDLE"}[new_state])
+                        {AI_ARMED: "AI-ARMED", IDLE: "IDLE"}.get(new_state, "?"))
 
-        # Leaving AI_ARMED -> stop camera
-        if old >= AI_ARMED and new_state == IDLE:
-            if self._camera_started:
-                self.camera.stop()
-                self._camera_started = False
-            logger.info("AI_ARMED -> IDLE: camera stopped")
+        if old == IDLE and new_state == AI_ARMED:
+            logger.info("IDLE -> AI-ARMED: ready to track")
 
-        # Entering AI_ARMED -> start camera
-        if new_state >= AI_ARMED and not self._camera_started:
-            self.camera.start()
-            self._camera_started = True
-            logger.info("IDLE -> AI_ARMED: camera started, ready to track")
+        if old == AI_ARMED and new_state == IDLE:
+            logger.info("AI-ARMED -> IDLE")
 
         # Entering TRACKING -> init tracker with centered bbox
         if new_state == TRACKING:
@@ -277,16 +270,11 @@ class TrackingPipeline:
         self._running = True
         period = 1.0 / self.cfg.loop_hz
 
-        # No MSP -> preview-only mode (for testing with video files)
         if not self._msp_connected:
-            if not self._camera_started:
-                self.camera.start()
-                self._camera_started = True
             self.cfg.show_preview = True
             logger.info("Preview-only mode (no MSP). Press 'q' to quit.")
-
         else:
-            logger.info("Pipeline running, waiting for AUX arm signal...")
+            logger.info("Pipeline running, waiting for AUX signal...")
 
         try:
             while self._running:
@@ -298,9 +286,8 @@ class TrackingPipeline:
                 if self._msp_connected:
                     self._poll_aux_state()
 
-                # Get frame if camera is running
-                if self._camera_started:
-                    frame = self.camera.read()
+                # Always grab frames
+                frame = self.camera.read()
 
                 if self._state == TRACKING and frame is not None:
                     # Track + control + send RC
