@@ -70,6 +70,7 @@ class MSPConnection:
         with self._lock:
             if not self._serial or not self._serial.is_open:
                 return None
+            self._serial.reset_input_buffer()
             self._serial.write(msp_encode(code))
             header = self._serial.read(5)
             if len(header) < 5 or header[:3] != b"$M>":

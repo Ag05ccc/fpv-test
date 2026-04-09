@@ -126,6 +126,7 @@ class TrackingPipeline:
         self._loop_fps = 0.0
         self._last_rc = None
         self._debug_counter = 0
+        self._lost_count = 0
 
     @property
     def state_name(self):
@@ -162,9 +163,9 @@ class TrackingPipeline:
 
     # ── state transitions ─────────────────────────────────────────
 
-    def _transition_to(self, new_state):
+    def _transition_to(self, new_state, force=False):
         old = self._state
-        if new_state == old:
+        if new_state == old and not force:
             return
 
         # Leaving TRACKING -> stop sending RC, real receiver takes over
@@ -295,6 +296,17 @@ class TrackingPipeline:
                     self.controller.update(result)
                     self.msp.send_rc(self.controller.channels)
 
+                    # If target lost for too long, drop to AI_ARMED
+                    # so the next AUX high cycle re-inits the tracker
+                    if result.found:
+                        self._lost_count = 0
+                    else:
+                        self._lost_count += 1
+                        if self._lost_count > self.cfg.loop_hz * 2:  # ~2 seconds
+                            logger.info("Target lost for 2s, dropping to AI-ARMED")
+                            self._transition_to(AI_ARMED)
+                            self._lost_count = 0
+
                 # GCS telemetry
                 if self.gcs and self._state >= AI_ARMED:
                     self._send_telemetry(result)
@@ -326,7 +338,6 @@ class TrackingPipeline:
 
     def _send_telemetry(self, result):
         ctrl = self.controller
-        attitude = self.msp.get_attitude()
         packet = TelemetryPacket(
             timestamp=time.time(),
             target_found=result.found,
@@ -337,10 +348,6 @@ class TrackingPipeline:
             forward_error=ctrl.forward_error,
             yaw_output=ctrl.yaw_output,
             forward_output=ctrl.forward_output,
-            roll=attitude["roll"] if attitude else 0.0,
-            pitch=attitude["pitch"] if attitude else 0.0,
-            yaw=attitude["yaw"] if attitude else 0.0,
-            attitude_valid=attitude is not None,
             loop_fps=self._loop_fps,
         )
         self.gcs.send_telemetry(packet)
