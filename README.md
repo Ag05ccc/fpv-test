@@ -1,4 +1,4 @@
-# fpv-test
+# Kenet
 
 Visual target tracking + PID control + Betaflight MSP for FPV drones.
 
@@ -13,7 +13,7 @@ USB Camera -> CameraCapture (threaded) -> ObjectTracker (CSRT/KCF)
 ## Project Structure
 
 ```
-modules/
+kenet/
   __init__.py       - Package exports
   camera.py         - Threaded OpenCV video capture
   tracker.py        - CSRT / KCF object tracking
@@ -21,7 +21,7 @@ modules/
   msp.py            - MSPv1 serial protocol for Betaflight
   gcs.py            - UDP telemetry to ground control station
   pipeline.py       - Two-stage state machine + control loop
-example.py          - CLI entry point
+kenet.py            - CLI entry point
 quick_gcs.py        - Minimal telemetry viewer for testing
 ```
 
@@ -58,7 +58,7 @@ ls /dev/ttyACM*       # usually /dev/ttyACM0
 
 ```bash
 # Terminal 1 — run the tracking pipeline
-python example.py --port /dev/ttyACM0 --gcs-host 127.0.0.1
+python kenet.py --port /dev/ttyACM0 --gcs-host 127.0.0.1
 
 # Terminal 2 — view live telemetry
 python quick_gcs.py
@@ -97,7 +97,7 @@ python -c "import socket,json; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
 
 ```bash
 # SSH into your Pi/Jetson, then:
-python example.py --port /dev/ttyAMA0 --gcs-host 192.168.1.100
+python kenet.py --port /dev/ttyAMA0 --gcs-host 192.168.1.100
 ```
 
 ### Run GCS on your laptop (same network)
@@ -188,7 +188,7 @@ save
 
 ## CLI Reference
 
-### example.py
+### kenet.py
 
 ```
 --port          FC serial port (default: /dev/ttyAMA0)

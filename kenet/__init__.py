@@ -1,5 +1,5 @@
 """
-modules - Visual target tracking and PID control for Betaflight FC.
+kenet - Visual target tracking and PID control for Betaflight FC.
 """
 
 from .controller import PIDGains

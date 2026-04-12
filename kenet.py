@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """
-Example: run the tracking pipeline with two-stage AUX arming.
-
-  AUX1 (--arm-ch)   = arm pipeline (start camera, systems ready)
-  AUX2 (--track-ch) = start tracking (send RC override)
+Kenet — Visual target tracking + PID control for FPV drones.
 
 Usage:
-    # Default: AUX1=ch4, AUX2=ch5
-    python example.py --port /dev/ttyAMA0
+    # Default: AUX ch7 (3-position)
+    python kenet.py --port /dev/ttyAMA0
 
     # Custom AUX channel and bbox size
-    python example.py --aux-ch 4 --track-size 120
+    python kenet.py --aux-ch 4 --track-size 120
 
     # With GCS telemetry
-    python example.py --gcs-host 192.168.1.100
+    python kenet.py --gcs-host 192.168.1.100
 
     # Disable GCS
-    python example.py --no-gcs
+    python kenet.py --no-gcs
 
     # Test with a video file instead of a camera
-    python example.py --camera test_video.mp4 --no-gcs
+    python kenet.py --camera test_video.mp4 --no-gcs
 """
 
 import argparse
-from modules import PipelineConfig, TrackingPipeline, PIDGains
+from kenet import PipelineConfig, TrackingPipeline, PIDGains
 
 
 def main():
