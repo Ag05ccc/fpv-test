@@ -19,12 +19,29 @@ class MSPCode(IntEnum):
     MSP_ATTITUDE = 108
 
 
+class MSPError(RuntimeError):
+    """Base class for MSP protocol errors."""
+
+
+class MSPChecksumError(MSPError):
+    """Raised when an MSP response checksum does not match."""
+
+
+class MSPResponseError(MSPError):
+    """Raised when the FC returns an MSP error frame."""
+
+
+def msp_checksum(code: int, payload: bytes = b"") -> int:
+    checksum = len(payload) ^ int(code)
+    for b in payload:
+        checksum ^= b
+    return checksum
+
+
 def msp_encode(code: int, payload: bytes = b"") -> bytes:
     """Encode an MSPv1 message: $M< len code payload checksum."""
     size = len(payload)
-    checksum = size ^ code
-    for b in payload:
-        checksum ^= b
+    checksum = msp_checksum(code, payload)
     return b"$M<" + bytes([size, code]) + payload + bytes([checksum])
 
 
@@ -70,16 +87,56 @@ class MSPConnection:
         with self._lock:
             if not self._serial or not self._serial.is_open:
                 return None
-            self._serial.reset_input_buffer()
             self._serial.write(msp_encode(code))
-            header = self._serial.read(5)
-            if len(header) < 5 or header[:3] != b"$M>":
+            for _ in range(4):
+                try:
+                    frame = self._read_frame()
+                except MSPError as e:
+                    logger.debug("MSP request %s failed: %s", code, e)
+                    return None
+                if frame is None:
+                    return None
+                response_code, payload = frame
+                if response_code == int(code):
+                    return payload
+                logger.debug("Ignoring stale MSP response code %s", response_code)
+            return None
+
+    def _read_frame(self):
+        """Read one MSPv1 response frame, scanning past unrelated bytes."""
+        while True:
+            b = self._serial.read(1)
+            if not b:
                 return None
-            size = header[3]
+            if b != b"$":
+                continue
+
+            if self._serial.read(1) != b"M":
+                continue
+
+            direction = self._serial.read(1)
+            if direction not in (b">", b"!"):
+                continue
+
+            header = self._serial.read(2)
+            if len(header) < 2:
+                return None
+            size, code = header[0], header[1]
+
             rest = self._serial.read(size + 1)
             if len(rest) < size + 1:
                 return None
-            return rest[:size]
+            payload = rest[:size]
+            checksum = rest[size]
+            expected = msp_checksum(code, payload)
+            if checksum != expected:
+                raise MSPChecksumError(
+                    "bad checksum for code %d: got 0x%02x, expected 0x%02x" %
+                    (code, checksum, expected)
+                )
+            if direction == b"!":
+                raise MSPResponseError("FC returned MSP error for code %d" % code)
+            return code, payload
 
     def get_rc_channels(self):
         """Read current RC channel values from FC via MSP_RC."""

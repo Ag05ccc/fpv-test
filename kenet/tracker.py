@@ -15,6 +15,10 @@ class TrackerType:
     KCF = "KCF"
 
 
+class TrackerUnavailableError(RuntimeError):
+    """Raised when the requested OpenCV tracker backend is not installed."""
+
+
 @dataclass
 class TrackResult:
     found: bool = False
@@ -37,11 +41,23 @@ class ObjectTracker:
         self._initialized = False
 
     def _create_cv_tracker(self):
-        if self.tracker_type == TrackerType.CSRT:
-            return cv2.TrackerCSRT.create()
-        elif self.tracker_type == TrackerType.KCF:
-            return cv2.TrackerKCF.create()
-        raise ValueError("Unknown tracker type: %s" % self.tracker_type)
+        if self.tracker_type not in (TrackerType.CSRT, TrackerType.KCF):
+            raise ValueError("Unknown tracker type: %s" % self.tracker_type)
+
+        tracker_name = "Tracker%s" % self.tracker_type
+        last_error = None
+        for factory in _tracker_factories(tracker_name):
+            try:
+                return factory()
+            except Exception as e:
+                last_error = e
+
+        raise TrackerUnavailableError(
+            "%s is unavailable in this OpenCV build. Install "
+            "opencv-contrib-python (or opencv-contrib-python-headless on "
+            "headless systems) and make sure opencv-python is not installed "
+            "in the same environment." % tracker_name
+        ) from last_error
 
     def init(self, frame, bbox):
         """Initialize tracker with a bounding box (x, y, w, h)."""
@@ -66,3 +82,26 @@ class ObjectTracker:
         x, y, w, h = [int(v) for v in bbox]
         cx, cy = x + w / 2, y + h / 2
         return TrackResult(found=True, bbox=(x, y, w, h), center=(cx, cy))
+
+
+def _tracker_factories(tracker_name):
+    """Yield OpenCV tracker constructors across common OpenCV API shapes."""
+    create_func = getattr(cv2, "%s_create" % tracker_name, None)
+    if create_func is not None:
+        yield create_func
+
+    tracker_cls = getattr(cv2, tracker_name, None)
+    if tracker_cls is not None and hasattr(tracker_cls, "create"):
+        yield tracker_cls.create
+
+    legacy = getattr(cv2, "legacy", None)
+    if legacy is None:
+        return
+
+    legacy_create_func = getattr(legacy, "%s_create" % tracker_name, None)
+    if legacy_create_func is not None:
+        yield legacy_create_func
+
+    legacy_tracker_cls = getattr(legacy, tracker_name, None)
+    if legacy_tracker_cls is not None and hasattr(legacy_tracker_cls, "create"):
+        yield legacy_tracker_cls.create

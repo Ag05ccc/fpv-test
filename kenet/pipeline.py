@@ -1,11 +1,12 @@
 """
 pipeline - Ties all modules together into the main tracking loop.
 
-Two-stage AUX arming:
-  AUX1 (arm)   -> starts camera, systems ready, pilot keeps full control
-  AUX2 (track) -> starts tracker, Pi sends MSP_SET_RAW_RC (overrides control)
+Single-switch AUX arming:
+  Low  -> IDLE, pilot keeps full control
+  Mid  -> AI_ARMED, camera/pipeline ready, pilot keeps full control
+  High -> TRACKING, tracker starts, Pi sends MSP_SET_RAW_RC
 
-When either AUX goes low, Pi stops sending RC -> real receiver takes over.
+When AUX drops below tracking, Pi stops sending RC -> real receiver takes over.
 Requires Betaflight MSP Override feature + a real RC receiver on the FC.
 """
 
@@ -77,6 +78,7 @@ class PipelineConfig:
     aux_ch: int = 7              # AUX4 channel (3-position switch)
     aux_arm_threshold: int = 1300    # above this = AI_ARMED
     aux_track_threshold: int = 1700  # above this = TRACKING
+    aux_poll_hz: float = 15.0        # MSP_RC polling rate
     track_bbox_size: int = 100       # fixed bbox size in pixels
 
     # GCS
@@ -103,7 +105,8 @@ class TrackingPipeline:
         AI-ARMED — ready to track, still not sending RC
         TRACKING — tracker active, Pi sends MSP_SET_RAW_RC via MSP Override
 
-    When Pi stops sending RC, real receiver takes over. No failsafe.
+    When Pi stops sending RC, the real receiver takes over without relying on a
+    failsafe handoff.
     """
 
     def __init__(self, config):
@@ -127,6 +130,8 @@ class TrackingPipeline:
         self._last_rc = None
         self._debug_counter = 0
         self._lost_count = 0
+        self._last_aux_poll_time = 0.0
+        self._preview_available = True
 
     @property
     def state_name(self):
@@ -158,7 +163,10 @@ class TrackingPipeline:
         if self.gcs:
             self.gcs.disconnect()
         if self.cfg.show_preview:
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
         logger.info("Pipeline stopped")
 
     # ── state transitions ─────────────────────────────────────────
@@ -232,6 +240,15 @@ class TrackingPipeline:
         else:
             self._transition_to(IDLE)
 
+    def _aux_poll_due(self, now=None):
+        if self.cfg.aux_poll_hz <= 0:
+            return True
+        now = time.monotonic() if now is None else now
+        if now - self._last_aux_poll_time < 1.0 / self.cfg.aux_poll_hz:
+            return False
+        self._last_aux_poll_time = now
+        return True
+
     # ── debug output ──────────────────────────────────────────────
 
     def _debug_print(self, result):
@@ -272,8 +289,10 @@ class TrackingPipeline:
         period = 1.0 / self.cfg.loop_hz
 
         if not self._msp_connected:
-            self.cfg.show_preview = True
-            logger.info("Preview-only mode (no MSP). Press 'q' to quit.")
+            if self.cfg.show_preview:
+                logger.info("Preview-only mode (no MSP). Press 'q' to quit.")
+            else:
+                logger.info("Headless mode without MSP. Press Ctrl-C to quit.")
         else:
             logger.info("Pipeline running, waiting for AUX signal...")
 
@@ -283,8 +302,13 @@ class TrackingPipeline:
                 result = TrackResult()
                 frame = None
 
+                if self.gcs:
+                    self._handle_gcs_commands()
+                    if not self._running:
+                        break
+
                 # Poll AUX state (only if MSP connected)
-                if self._msp_connected:
+                if self._msp_connected and self._aux_poll_due(t_start):
                     self._poll_aux_state()
 
                 # Always grab frames
@@ -310,14 +334,16 @@ class TrackingPipeline:
                 # GCS telemetry
                 if self.gcs and self._state >= AI_ARMED:
                     self._send_telemetry(result)
-                    self._handle_gcs_commands()
 
                 # Preview
-                if self.cfg.show_preview:
+                if self.cfg.show_preview and self._preview_available:
                     if frame is not None:
                         self._draw_preview(frame, result)
                     else:
-                        cv2.waitKey(1)
+                        try:
+                            cv2.waitKey(1)
+                        except cv2.error as e:
+                            self._disable_preview(e)
 
                 # Debug
                 self._debug_print(result)
@@ -337,7 +363,11 @@ class TrackingPipeline:
     # ── GCS helpers ───────────────────────────────────────────────
 
     def _send_telemetry(self, result):
+        if not self.gcs.ready_to_send():
+            return False
+
         ctrl = self.controller
+        attitude = self.msp.get_attitude() if self._msp_connected else None
         packet = TelemetryPacket(
             timestamp=time.time(),
             target_found=result.found,
@@ -348,9 +378,13 @@ class TrackingPipeline:
             forward_error=ctrl.forward_error,
             yaw_output=ctrl.yaw_output,
             forward_output=ctrl.forward_output,
+            roll=attitude["roll"] if attitude else 0.0,
+            pitch=attitude["pitch"] if attitude else 0.0,
+            yaw=attitude["yaw"] if attitude else 0.0,
+            attitude_valid=attitude is not None,
             loop_fps=self._loop_fps,
         )
-        self.gcs.send_telemetry(packet)
+        return self.gcs.send_telemetry(packet)
 
     def _handle_gcs_commands(self):
         while True:
@@ -420,6 +454,17 @@ class TrackingPipeline:
             cv2.putText(frame, "yaw_out: %.0f  fwd_out: %.0f" % (ctrl.yaw_output, ctrl.forward_output),
                         (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        cv2.imshow("Drone Tracker", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            self._running = False
+        try:
+            cv2.imshow("Drone Tracker", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                self._running = False
+        except cv2.error as e:
+            self._disable_preview(e)
+
+    def _disable_preview(self, error):
+        self._preview_available = False
+        logger.warning(
+            "OpenCV preview disabled (%s). Continue in headless mode. "
+            "Use --headless to suppress preview, or run with GUI-capable OpenCV.",
+            error,
+        )

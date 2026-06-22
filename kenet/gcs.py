@@ -113,19 +113,26 @@ class GCSLink:
 
     # ── Telemetry (outbound) ──────────────────────────────────────
 
+    def ready_to_send(self, now=None):
+        """Return True when the telemetry rate limit allows a new packet."""
+        now = time.monotonic() if now is None else now
+        return now - self._last_send_time >= self._min_send_interval
+
     def send_telemetry(self, packet):
         """Send a telemetry packet if enough time has elapsed since the last send."""
         now = time.monotonic()
-        if now - self._last_send_time < self._min_send_interval:
-            return
+        if not self.ready_to_send(now):
+            return False
         self._last_send_time = now
 
         if not self._tx_sock:
-            return
+            return False
         try:
             self._tx_sock.sendto(packet.to_json(), self.gcs_addr)
+            return True
         except OSError as e:
             logger.debug("GCS send failed: %s", e)
+            return False
 
     # ── Commands (inbound) ────────────────────────────────────────
 
