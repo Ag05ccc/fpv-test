@@ -17,6 +17,8 @@ import socket
 import struct
 import time
 
+from sitl_rc_channels import AUTOPILOT_MODE_CHANNEL
+
 
 JS_EVENT_FORMAT = "<IhBB"
 JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FORMAT)
@@ -153,6 +155,14 @@ def make_channels(joystick, mapping):
     return channels
 
 
+def apply_forced_mode_pwm(channels, value):
+    """Force CH7/AUX3 for Betaflight flight-mode testing when a switch is absent."""
+    if value is None:
+        return channels
+    channels[AUTOPILOT_MODE_CHANNEL] = clamp_rc(value)
+    return channels
+
+
 def pack_rc_packet(channels):
     return struct.pack("<d16H", time.time(), *channels)
 
@@ -219,6 +229,7 @@ def run(args):
                 print_changed_events(events, args.show_init)
 
             channels = make_channels(joystick, CHANNEL_MAP)
+            apply_forced_mode_pwm(channels, args.force_mode_pwm)
 
             now = time.monotonic()
             if args.send and now >= next_send:
@@ -274,6 +285,8 @@ def parse_args():
                         help="Send one packet and exit")
     parser.add_argument("--duration", type=float, default=0.0,
                         help="Stop after N seconds; 0 means run until Ctrl-C")
+    parser.add_argument("--force-mode-pwm", type=int, default=None,
+                        help="Force CH7/AUX3 to this PWM value, e.g. 1500 for ANGLE mode tests")
     args = parser.parse_args()
     if not args.dry_run and not args.send and not args.events and not args.changes:
         parser.error("choose --dry-run, --send, --events, and/or --changes")
@@ -281,6 +294,8 @@ def parse_args():
         parser.error("--rate-hz must be positive")
     if args.print_hz <= 0:
         parser.error("--print-hz must be positive")
+    if args.force_mode_pwm is not None and not 1000 <= args.force_mode_pwm <= 2000:
+        parser.error("--force-mode-pwm must be between 1000 and 2000")
     return args
 
 

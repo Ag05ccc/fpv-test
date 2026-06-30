@@ -3,7 +3,7 @@
 Kenet — Visual target tracking + PID control for FPV drones.
 
 Usage:
-    # Default: AUX ch7 (3-position)
+    # Default: AUX ch5 / CH6 / AUX2 (3-position)
     python kenet.py --port /dev/ttyAMA0
 
     # Custom AUX channel and bbox size
@@ -21,16 +21,19 @@ Usage:
 
 import argparse
 from kenet import PipelineConfig, TrackingPipeline, PIDGains
+from kenet.state_machine import DEFAULT_KENET_AUX_CH
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="/dev/ttyAMA0", help="FC serial port")
+    ap.add_argument("--msp-tcp", default=None,
+                    help="Betaflight SITL MSP TCP endpoint, e.g. 127.0.0.1:5761")
     ap.add_argument("--camera", default="0",
                     help="Camera index (0,1,...) or video file path")
     ap.add_argument("--tracker", default="CSRT", choices=["CSRT", "KCF"])
-    ap.add_argument("--aux-ch", default=7, type=int,
-                    help="3-position AUX channel (0-indexed, default=7 / AUX4)")
+    ap.add_argument("--aux-ch", default=DEFAULT_KENET_AUX_CH, type=int,
+                    help="3-position AUX channel (0-indexed, default=5 / CH6 / AUX2)")
     ap.add_argument("--track-size", default=100, type=int,
                     help="Fixed bbox size in pixels for tracker init")
     ap.add_argument("--loop-hz", default=30, type=int)
@@ -78,10 +81,13 @@ def main():
 
     # Use int for camera index, string for video file
     cam = int(args.camera) if args.camera.isdigit() else args.camera
+    msp_port = args.port
+    if args.msp_tcp:
+        msp_port = args.msp_tcp if args.msp_tcp.startswith("tcp://") else "tcp://%s" % args.msp_tcp
 
     cfg = PipelineConfig(
         camera_source=cam,
-        serial_port=args.port,
+        serial_port=msp_port,
         tracker_type=args.tracker,
         loop_hz=args.loop_hz,
         show_preview=not args.headless,

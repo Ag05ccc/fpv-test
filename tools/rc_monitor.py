@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 try:
     from sitl_rc_bridge import AXIS_MAX, CHANNEL_MAP, LinuxJoystick, make_channels
+    from sitl_rc_channels import first_n_channel_labels
 except Exception as exc:
     print("Failed to import sitl_rc_bridge.py: %s" % exc, file=sys.stderr)
     raise SystemExit(2)
@@ -25,16 +26,7 @@ except Exception as exc:
 tk = None
 ttk = None
 
-RC_CHANNEL_LABELS = [
-    "Roll",
-    "Pitch",
-    "Throttle",
-    "Yaw",
-    "AUX1",
-    "AUX2",
-    "AUX3",
-    "AUX4",
-]
+RC_CHANNEL_LABELS = first_n_channel_labels(8)
 
 
 def load_tkinter(quiet=False):

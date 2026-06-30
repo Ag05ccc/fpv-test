@@ -3,12 +3,18 @@
 Amaç: TBS Tango 2 kumandadaki switch'leri Linux USB joystick, Betaflight SITL
 ve Kenet test akışında doğru RC/AUX kanallarına taşımak.
 
+Komutlarda joystick cihazı için taşınabilir değişken kullan:
+
+```bash
+export JOY_DEV="${JOY_DEV:-/dev/input/js0}"
+```
+
 ## Mevcut durum
 
 Sistem kumandayı USB joystick olarak görüyor:
 
 ```text
-/dev/input/js0
+$JOY_DEV
 Team-BlackSheep TBS Joystick
 7 axis, 24 button
 ```
@@ -27,7 +33,7 @@ Team-BlackSheep TBS Joystick
 Gözlem: Sağ taraftaki ikinci 3-state switch oynatıldığında:
 
 ```bash
-python tools/sitl_rc_bridge.py --device /dev/input/js0 --changes
+python tools/sitl_rc_bridge.py --device "$JOY_DEV" --changes
 ```
 
 komutu hiçbir `axis` veya `button` değişimi göstermedi.
@@ -83,7 +89,7 @@ high -> +100% -> USB raw +32767 -> RC 2000
 Önce sadece raw event kontrolü:
 
 ```bash
-python tools/sitl_rc_bridge.py --device /dev/input/js0 --changes
+python tools/sitl_rc_bridge.py --device "$JOY_DEV" --changes
 ```
 
 Sağdaki ikinci 3-state switch oynatıldığında buna benzer çıktı beklenir:

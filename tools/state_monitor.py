@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Single-file web GUI for watching Kenet and autopilot switch states.
+Compatibility shim for the Kenet SITL dashboard.
 
-This intentionally uses only Python stdlib. It reads /dev/input/jsX directly and
-serves a small local web UI with:
+By default this launches tools/sitl_dashboard.py with matching device/channel
+arguments. Pass --legacy to run the old state-only stdlib web UI, which reads
+/dev/input/jsX directly and shows:
   - Kenet algorithm state from the 3-position mode switch
   - Autopilot arm command state from the 2-position switch
   - Autopilot mode command state from the second 3-position switch
@@ -11,113 +12,22 @@ serves a small local web UI with:
 """
 
 import argparse
-import errno
 import glob
 import json
-import os
-import select
-import struct
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
-
-JS_EVENT_FORMAT = "<IhBB"
-JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FORMAT)
-JS_EVENT_BUTTON = 0x01
-JS_EVENT_AXIS = 0x02
-JS_EVENT_INIT = 0x80
-AXIS_MAX = 32767.0
-
-RC_LABELS = ["Roll", "Pitch", "Throttle", "Yaw", "AUX1", "AUX2", "AUX3", "AUX4"]
+from sitl_rc_bridge import AXIS_MAX, LinuxJoystick, make_channels
+from sitl_rc_channels import channel_label, first_n_channel_labels
 
 
-class LinuxJoystick:
-    def __init__(self, device):
-        self.device = device
-        self.fd = None
-        self.axes = {}
-        self.buttons = {}
-
-    def open(self):
-        self.close()
-        self.fd = os.open(self.device, os.O_RDONLY | os.O_NONBLOCK)
-
-    def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-
-    def poll(self, timeout=0):
-        if self.fd is None:
-            return []
-        ready, _, _ = select.select([self.fd], [], [], timeout)
-        if not ready:
-            return []
-
-        events = []
-        while True:
-            try:
-                data = os.read(self.fd, JS_EVENT_SIZE)
-            except BlockingIOError:
-                break
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    break
-                raise
-
-            if not data or len(data) < JS_EVENT_SIZE:
-                break
-
-            t_ms, value, event_type, number = struct.unpack(JS_EVENT_FORMAT, data)
-            is_init = bool(event_type & JS_EVENT_INIT)
-            event_type &= ~JS_EVENT_INIT
-
-            if event_type == JS_EVENT_AXIS:
-                self.axes[number] = value
-                kind = "axis"
-            elif event_type == JS_EVENT_BUTTON:
-                self.buttons[number] = value
-                kind = "button"
-            else:
-                kind = "unknown"
-            events.append({
-                "time_ms": t_ms,
-                "kind": kind,
-                "number": number,
-                "value": value,
-                "init": is_init,
-            })
-        return events
-
-
-def clamp_rc(value):
-    return int(max(1000, min(2000, round(value))))
-
-
-def axis_to_rc(value, invert=False):
-    if invert:
-        value = -value
-    return clamp_rc(1500 + (value / AXIS_MAX) * 500)
-
-
-def axis_to_two_pos_rc(value, invert=False):
-    if invert:
-        value = -value
-    return 2000 if value > 0 else 1000
-
-
-def axis_to_three_pos_rc(value, invert=False):
-    if invert:
-        value = -value
-    if value < -AXIS_MAX / 3:
-        return 1000
-    if value > AXIS_MAX / 3:
-        return 2000
-    return 1500
+RC_LABELS = first_n_channel_labels(8)
 
 
 def kenet_state(value, arm_threshold, track_threshold):
@@ -140,9 +50,40 @@ def three_position_state(value):
     return "MID"
 
 
+def build_channel_map(args):
+    return {
+        "roll": {"channel": 0, "source": "axis", "index": 0, "invert": False},
+        "pitch": {"channel": 1, "source": "axis", "index": 1, "invert": True},
+        "throttle": {"channel": 2, "source": "axis", "index": 2, "invert": False},
+        "yaw": {"channel": 3, "source": "axis", "index": 3, "invert": False},
+        "autopilot": {
+            "channel": args.autopilot_ch,
+            "source": "axis",
+            "index": args.autopilot_axis,
+            "invert": args.autopilot_invert,
+            "two_pos": True,
+        },
+        "algorithm": {
+            "channel": args.algorithm_ch,
+            "source": "axis",
+            "index": args.algorithm_axis,
+            "invert": args.algorithm_invert,
+            "three_pos": True,
+        },
+        "autopilot_mode": {
+            "channel": args.autopilot_mode_ch,
+            "source": "axis",
+            "index": args.autopilot_mode_axis,
+            "invert": args.autopilot_mode_invert,
+            "three_pos": True,
+        },
+    }
+
+
 class StateSampler:
     def __init__(self, args):
         self.args = args
+        self.channel_map = build_channel_map(args)
         self.joystick = LinuxJoystick(args.device)
         self.lock = threading.Lock()
         self.running = False
@@ -187,7 +128,7 @@ class StateSampler:
                 with self.lock:
                     self.axes = dict(self.joystick.axes)
                     self.buttons = dict(self.joystick.buttons)
-                    self.channels = self._make_channels(self.axes)
+                    self.channels = make_channels(self.joystick, self.channel_map)[:8]
                     if events:
                         self.last_event_time = time.monotonic()
                     self.error = None
@@ -208,30 +149,6 @@ class StateSampler:
             "Waiting for joystick device %s: %s. No /dev/input/js* devices found." %
             (self.args.device, exc)
         )
-
-    def _make_channels(self, axes):
-        channels = [1500] * 8
-        channels[0] = axis_to_rc(axes.get(0, 0))
-        channels[1] = axis_to_rc(axes.get(1, 0), invert=True)
-        channels[2] = axis_to_rc(axes.get(2, 0))
-        channels[3] = axis_to_rc(axes.get(3, 0))
-
-        if 0 <= self.args.autopilot_ch < len(channels):
-            channels[self.args.autopilot_ch] = axis_to_two_pos_rc(
-                axes.get(self.args.autopilot_axis, 0),
-                invert=self.args.autopilot_invert,
-            )
-        if 0 <= self.args.algorithm_ch < len(channels):
-            channels[self.args.algorithm_ch] = axis_to_three_pos_rc(
-                axes.get(self.args.algorithm_axis, 0),
-                invert=self.args.algorithm_invert,
-            )
-        if 0 <= self.args.autopilot_mode_ch < len(channels):
-            channels[self.args.autopilot_mode_ch] = axis_to_three_pos_rc(
-                axes.get(self.args.autopilot_mode_axis, 0),
-                invert=self.args.autopilot_mode_invert,
-            )
-        return channels
 
     def snapshot(self):
         with self.lock:
@@ -271,7 +188,7 @@ class StateSampler:
                 "raw_axis_value": axes.get(self.args.algorithm_axis),
                 "axis": self.args.algorithm_axis,
                 "channel": self.args.algorithm_ch,
-                "channel_label": "CH%d" % (self.args.algorithm_ch + 1),
+                "channel_label": "%s CH%d" % (channel_label(self.args.algorithm_ch), self.args.algorithm_ch + 1),
             },
             "autopilot": {
                 "state": auto_state,
@@ -279,7 +196,7 @@ class StateSampler:
                 "raw_axis_value": axes.get(self.args.autopilot_axis),
                 "axis": self.args.autopilot_axis,
                 "channel": self.args.autopilot_ch,
-                "channel_label": "CH%d" % (self.args.autopilot_ch + 1),
+                "channel_label": "%s CH%d" % (channel_label(self.args.autopilot_ch), self.args.autopilot_ch + 1),
             },
             "autopilot_mode": {
                 "state": mode_state,
@@ -287,7 +204,7 @@ class StateSampler:
                 "raw_axis_value": axes.get(self.args.autopilot_mode_axis),
                 "axis": self.args.autopilot_mode_axis,
                 "channel": self.args.autopilot_mode_ch,
-                "channel_label": "CH%d" % (self.args.autopilot_mode_ch + 1),
+                "channel_label": "%s CH%d" % (channel_label(self.args.autopilot_mode_ch), self.args.autopilot_mode_ch + 1),
             },
             "channels": [
                 {"index": idx, "label": RC_LABELS[idx], "value": value}
@@ -604,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="/dev/input/js0")
     parser.add_argument("--host", default="127.0.0.1")
@@ -626,7 +543,9 @@ def parse_args():
                         help="0-indexed RC channel for autopilot mode switch")
     parser.add_argument("--autopilot-mode-invert", action="store_true")
     parser.add_argument("--open", action="store_true", help="Open browser")
-    args = parser.parse_args()
+    parser.add_argument("--legacy", action="store_true",
+                        help="Run the old state-only web UI instead of redirecting to sitl_dashboard.py")
+    args = parser.parse_args(argv)
     if args.rate_hz <= 0:
         parser.error("--rate-hz must be positive")
     for name in ("algorithm_ch", "autopilot_ch", "autopilot_mode_ch"):
@@ -635,8 +554,34 @@ def parse_args():
     return args
 
 
-def main():
-    args = parse_args()
+def build_dashboard_command(args):
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().with_name("sitl_dashboard.py")),
+        "--device", args.device,
+        "--host", args.host,
+        "--port", str(args.port),
+        "--arm-ch", str(args.autopilot_ch),
+        "--kenet-ch", str(args.algorithm_ch),
+        "--mode-ch", str(args.autopilot_mode_ch),
+    ]
+    if args.open:
+        command.append("--open")
+    return command
+
+
+def run_dashboard_redirect(args):
+    command = build_dashboard_command(args)
+    print(
+        "state_monitor.py is now a compatibility shim; launching sitl_dashboard.py.",
+        flush=True,
+    )
+    print("Use --legacy for the old state-only monitor.", flush=True)
+    print("command: %s" % " ".join(command), flush=True)
+    return subprocess.call(command)
+
+
+def run_legacy_monitor(args):
     sampler = StateSampler(args)
     try:
         sampler.start()
@@ -667,6 +612,13 @@ def main():
         server.server_close()
         sampler.stop()
     return 0
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not args.legacy:
+        return run_dashboard_redirect(args)
+    return run_legacy_monitor(args)
 
 
 if __name__ == "__main__":

@@ -9,5 +9,7 @@ __pycache__/
 .venv/
 fpv_env/
 eeprom.bin
+logs/
+*.pid
 test.mp4
 test-*.mp4

@@ -21,15 +21,20 @@ from .camera import CameraCapture
 from .tracker import ObjectTracker, TrackResult, TrackerType
 from .controller import FlightController, PIDGains
 from .msp import MSPConnection
+from .rc_channels import msp_rc_to_pilot_channels
 from .gcs import GCSLink, TelemetryPacket
+from .state_machine import (
+    AI_ARMED,
+    DEFAULT_AUX_ARM_THRESHOLD,
+    DEFAULT_AUX_TRACK_THRESHOLD,
+    DEFAULT_KENET_AUX_CH,
+    IDLE,
+    STATE_NAMES,
+    TRACKING,
+    state_from_aux,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# Pipeline states
-IDLE = 0       # monitoring AUX, not sending RC, pilot has full control
-AI_ARMED = 1      # camera running, systems ready, not sending RC
-TRACKING = 2   # tracker active, sending MSP_SET_RAW_RC
 
 
 @dataclass
@@ -75,9 +80,9 @@ class PipelineConfig:
     max_rc_rate: float = 200.0
 
     # AUX arming — single 3-position switch (0-indexed channel)
-    aux_ch: int = 7              # AUX4 channel (3-position switch)
-    aux_arm_threshold: int = 1300    # above this = AI_ARMED
-    aux_track_threshold: int = 1700  # above this = TRACKING
+    aux_ch: int = DEFAULT_KENET_AUX_CH  # CH6 / AUX2 3-position switch
+    aux_arm_threshold: int = DEFAULT_AUX_ARM_THRESHOLD
+    aux_track_threshold: int = DEFAULT_AUX_TRACK_THRESHOLD
     aux_poll_hz: float = 15.0        # MSP_RC polling rate
     track_bbox_size: int = 100       # fixed bbox size in pixels
 
@@ -128,14 +133,17 @@ class TrackingPipeline:
         self._msp_connected = False
         self._loop_fps = 0.0
         self._last_rc = None
+        self._last_override_channels = None
         self._debug_counter = 0
         self._lost_count = 0
+        self._tracking_reentry_blocked = False
         self._last_aux_poll_time = 0.0
         self._preview_available = True
+        self._warned_missing_pilot_rc_for_override = False
 
     @property
     def state_name(self):
-        return {IDLE: "IDLE", AI_ARMED: "AI-ARMED", TRACKING: "TRACKING"}[self._state]
+        return STATE_NAMES[self._state]
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -145,8 +153,8 @@ class TrackingPipeline:
         try:
             self.msp.connect()
             self._msp_connected = True
-        except serial.SerialException as e:
-            logger.warning("MSP serial failed (%s); running in preview-only mode", e)
+        except (serial.SerialException, OSError) as e:
+            logger.warning("MSP connection failed (%s); running in preview-only mode", e)
             self._msp_connected = False
         if self.gcs:
             try:
@@ -180,6 +188,7 @@ class TrackingPipeline:
         if old == TRACKING:
             self.tracker.reset()
             self.controller.reset()
+            self._last_override_channels = None
             logger.info("TRACKING -> %s: RC override stopped, pilot has control",
                         {AI_ARMED: "AI-ARMED", IDLE: "IDLE"}.get(new_state, "?"))
 
@@ -204,8 +213,7 @@ class TrackingPipeline:
                 y = h_frame // 2 - s // 2
                 self.tracker.init(frame, (x, y, s, s))
                 # Update controller center to match actual frame
-                self.controller._cx = w_frame / 2.0
-                self.controller._cy = h_frame / 2.0
+                self.controller.set_frame_center(w_frame, h_frame)
                 logger.info("AI_ARMED -> TRACKING: tracker started (%dx%d at center)", s, s)
             else:
                 logger.warning("No frame available, cannot start tracking")
@@ -220,10 +228,11 @@ class TrackingPipeline:
         Mid  (~1500) = AI_ARMED
         High (~2000) = TRACKING
         """
-        rc = self.msp.get_rc_channels()
-        if rc is None:
+        msp_rc = self.msp.get_rc_channels()
+        if msp_rc is None:
             return
 
+        rc = msp_rc_to_pilot_channels(msp_rc)
         self._last_rc = rc
 
         if len(rc) <= self.cfg.aux_ch:
@@ -231,11 +240,21 @@ class TrackingPipeline:
 
         val = rc[self.cfg.aux_ch]
 
-        if val > self.cfg.aux_track_threshold:
+        if val <= self.cfg.aux_track_threshold:
+            self._tracking_reentry_blocked = False
+
+        new_state = state_from_aux(
+            val,
+            self.cfg.aux_arm_threshold,
+            self.cfg.aux_track_threshold,
+            tracking_inhibited=self._tracking_reentry_blocked,
+        )
+
+        if new_state == TRACKING:
             if self._state == IDLE:
                 self._transition_to(AI_ARMED)
             self._transition_to(TRACKING)
-        elif val > self.cfg.aux_arm_threshold:
+        elif new_state == AI_ARMED:
             self._transition_to(AI_ARMED)
         else:
             self._transition_to(IDLE)
@@ -248,6 +267,50 @@ class TrackingPipeline:
             return False
         self._last_aux_poll_time = now
         return True
+
+    def _build_override_channels(self):
+        """Merge Kenet pitch/yaw into the latest pilot RC frame.
+
+        MSP_SET_RAW_RC carries a complete channel frame. The production safety
+        contract is still pitch/yaw only, so roll, throttle, and AUX channels
+        must come from the current pilot/receiver frame instead of the
+        controller's neutral defaults.
+        """
+        if not self._last_rc or len(self._last_rc) < self.cfg.num_channels:
+            if not self._warned_missing_pilot_rc_for_override:
+                logger.warning("Skipping MSP override: no complete pilot RC frame")
+                self._warned_missing_pilot_rc_for_override = True
+            return None
+
+        channels = list(self._last_rc[:self.cfg.num_channels])
+        ai_channels = self.controller.channels
+        for index in (self.cfg.pitch_ch, self.cfg.yaw_ch):
+            channels[index] = ai_channels[index]
+        self._last_override_channels = channels
+        self._warned_missing_pilot_rc_for_override = False
+        return channels
+
+    def _track_control_step(self, frame):
+        """Run one TRACKING control step and send MSP only with a found target."""
+        result = self.tracker.update(frame)
+
+        if not result.found:
+            self.controller.reset()
+            self._last_override_channels = None
+            self._lost_count += 1
+            if self._lost_count > self.cfg.loop_hz * 2:  # ~2 seconds
+                logger.info("Target lost for 2s, dropping to AI-ARMED")
+                self._tracking_reentry_blocked = True
+                self._transition_to(AI_ARMED)
+                self._lost_count = 0
+            return result
+
+        self._lost_count = 0
+        self.controller.update(result)
+        override_channels = self._build_override_channels()
+        if override_channels is not None:
+            self.msp.send_rc(override_channels)
+        return result
 
     # ── debug output ──────────────────────────────────────────────
 
@@ -268,7 +331,12 @@ class TrackingPipeline:
             sticks = "no RC data"
 
         ctrl = self.controller
-        line = "[%s] AUX4:%d | %s" % (self.state_name, aux_val, sticks)
+        line = "[%s] CH%d:%d | %s" % (
+            self.state_name,
+            self.cfg.aux_ch + 1,
+            aux_val,
+            sticks,
+        )
 
         if self._state == TRACKING:
             line += " | found=%s yaw_err=%.1f fwd_err=%.1f ch=[%s]" % (
@@ -277,6 +345,10 @@ class TrackingPipeline:
                 ctrl.forward_error,
                 ",".join(str(c) for c in ctrl.channels),
             )
+            if self._last_override_channels is not None:
+                line += " send=[%s]" % ",".join(
+                    str(c) for c in self._last_override_channels
+                )
 
         line += " | %.1f fps" % self._loop_fps
         print(line)
@@ -316,20 +388,7 @@ class TrackingPipeline:
 
                 if self._state == TRACKING and frame is not None:
                     # Track + control + send RC
-                    result = self.tracker.update(frame)
-                    self.controller.update(result)
-                    self.msp.send_rc(self.controller.channels)
-
-                    # If target lost for too long, drop to AI_ARMED
-                    # so the next AUX high cycle re-inits the tracker
-                    if result.found:
-                        self._lost_count = 0
-                    else:
-                        self._lost_count += 1
-                        if self._lost_count > self.cfg.loop_hz * 2:  # ~2 seconds
-                            logger.info("Target lost for 2s, dropping to AI-ARMED")
-                            self._transition_to(AI_ARMED)
-                            self._lost_count = 0
+                    result = self._track_control_step(frame)
 
                 # GCS telemetry
                 if self.gcs and self._state >= AI_ARMED:

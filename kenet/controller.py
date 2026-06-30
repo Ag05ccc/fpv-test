@@ -100,6 +100,11 @@ class FlightController:
     def channels(self):
         return list(self._channels)
 
+    def set_frame_center(self, width, height):
+        """Update the image center used for pixel-error control."""
+        self._cx = float(width) / 2.0
+        self._cy = float(height) / 2.0
+
     def reset(self):
         """Return all channels to neutral."""
         self.yaw_pid.reset()

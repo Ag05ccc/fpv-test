@@ -40,6 +40,10 @@ class ObjectTracker:
         self._tracker = None
         self._initialized = False
 
+    @property
+    def is_initialized(self):
+        return self._initialized
+
     def _create_cv_tracker(self):
         if self.tracker_type not in (TrackerType.CSRT, TrackerType.KCF):
             raise ValueError("Unknown tracker type: %s" % self.tracker_type)
