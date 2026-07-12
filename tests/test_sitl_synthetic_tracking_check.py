@@ -79,6 +79,19 @@ def test_build_checker_command_uses_external_acceptance_gate(tmp_path):
     assert command[command.index("--pitch-rc-rate") + 1] == "60"
     assert command[command.index("--pitch-rate") + 1] == "70"
     assert command[command.index("--pitch-rate-limit") + 1] == "450"
+    assert "--max-step-size" not in command
+
+
+def test_build_checker_command_passes_max_step_size(tmp_path):
+    args = apply_profile_defaults(parse_args([
+        "--profile", "centered",
+        "--max-step-size", "0.0025",
+    ]))
+    log = tmp_path / "diag.jsonl"
+
+    command = build_checker_command(args, log)
+
+    assert command[command.index("--max-step-size") + 1] == "0.0025"
 
 
 def test_build_mixer_command_uses_synthetic_target_profile(tmp_path):
@@ -165,6 +178,37 @@ def test_synthetic_mixer_summary_reports_missing_target_found_and_delta_limit(tm
     assert "target_found sample sayisi yetersiz: 0" in failures
     assert "source=kenet sample sayisi yetersiz: 0" in failures
     assert "mixer delta limiti asildi: 12 > 0" in failures
+
+
+def test_synthetic_mixer_summary_enforces_axis_delta_gates(tmp_path):
+    log = tmp_path / "mixer.jsonl"
+    write_jsonl(log, [
+        {
+            "event": "kenet_mixer_sample",
+            "state": "TRACKING",
+            "source": "kenet",
+            "target_found": True,
+            "first8": {"delta": [0, 2, 0, 6, 0, 0, 0, 0]},
+        }
+    ])
+    args = apply_profile_defaults(parse_args([
+        "--profile", "centered",
+        "--min-tracking-samples", "1",
+        "--min-target-found-samples", "1",
+        "--min-kenet-source-samples", "1",
+        "--max-abs-delta", "10",
+        "--min-abs-pitch-delta", "3",
+        "--min-abs-yaw-delta", "6",
+        "--max-abs-pitch-delta", "1",
+        "--max-abs-yaw-delta", "5",
+    ]))
+
+    failures = validate_mixer_summary(summarize_mixer_log(log), args)
+
+    assert "pitch delta yetersiz: 2 < 3" in failures
+    assert "pitch delta limiti asildi: 2 > 1" in failures
+    assert "yaw delta limiti asildi: 6 > 5" in failures
+    assert not any("yaw delta yetersiz" in failure for failure in failures)
 
 
 def test_empty_mixer_summary_validates_as_failures_not_key_error():

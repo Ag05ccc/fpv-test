@@ -11,13 +11,16 @@ Edit CHANNEL_MAP below after identifying your transmitter's axis/button layout.
 
 import argparse
 import errno
+import fcntl
+import json
 import os
 import select
 import socket
 import struct
 import time
+from pathlib import Path
 
-from sitl_rc_channels import AUTOPILOT_MODE_CHANNEL
+from sitl_rc_channels import ARM_CH, AUTOPILOT_MODE_CHANNEL, KENET_STATE_CH, YAW_CH
 
 
 JS_EVENT_FORMAT = "<IhBB"
@@ -25,6 +28,10 @@ JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FORMAT)
 JS_EVENT_BUTTON = 0x01
 JS_EVENT_AXIS = 0x02
 JS_EVENT_INIT = 0x80
+EV_EVENT_FORMAT = "llHHi"
+EV_EVENT_SIZE = struct.calcsize(EV_EVENT_FORMAT)
+EV_KEY = 0x01
+EV_ABS = 0x03
 AXIS_MAX = 32767.0
 
 
@@ -97,6 +104,99 @@ class LinuxJoystick:
         return events
 
 
+def _ioc(direction, type_, nr, size):
+    nr_bits = 8
+    type_bits = 8
+    size_bits = 14
+    nr_shift = 0
+    type_shift = nr_shift + nr_bits
+    size_shift = type_shift + type_bits
+    dir_shift = size_shift + size_bits
+    return (direction << dir_shift) | (ord(type_) << type_shift) | (nr << nr_shift) | (size << size_shift)
+
+
+def _eviocgabs(abs_code):
+    return _ioc(2, "E", 0x40 + abs_code, struct.calcsize("iiiiii"))
+
+
+def normalize_abs_value(value, minimum, maximum):
+    if maximum <= minimum:
+        return int(value)
+    centered = ((value - minimum) / float(maximum - minimum)) * 2.0 - 1.0
+    return int(max(-AXIS_MAX, min(AXIS_MAX, round(centered * AXIS_MAX))))
+
+
+class LinuxEventJoystick:
+    """Read Linux evdev joystick events and expose the same fields as LinuxJoystick."""
+
+    def __init__(self, device):
+        self.device = device
+        self.fd = None
+        self.axes = {}
+        self.buttons = {}
+        self.abs_ranges = {}
+
+    def open(self):
+        self.fd = os.open(self.device, os.O_RDONLY | os.O_NONBLOCK)
+        self._read_abs_state()
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def _read_abs_state(self):
+        for code in range(0, 64):
+            buf = bytearray(struct.calcsize("iiiiii"))
+            try:
+                fcntl.ioctl(self.fd, _eviocgabs(code), buf, True)
+            except OSError:
+                continue
+            value, minimum, maximum, _fuzz, _flat, _resolution = struct.unpack("iiiiii", buf)
+            if minimum == 0 and maximum == 0 and value == 0:
+                continue
+            self.abs_ranges[code] = (minimum, maximum)
+            self.axes[code] = normalize_abs_value(value, minimum, maximum)
+
+    def poll(self, timeout=0):
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return []
+
+        events = []
+        while True:
+            try:
+                data = os.read(self.fd, EV_EVENT_SIZE)
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                raise
+
+            if not data or len(data) < EV_EVENT_SIZE:
+                break
+
+            sec, usec, event_type, code, value = struct.unpack(EV_EVENT_FORMAT, data)
+            t_ms = sec * 1000 + usec // 1000
+            if event_type == EV_ABS:
+                minimum, maximum = self.abs_ranges.get(code, (-AXIS_MAX, AXIS_MAX))
+                normalized = normalize_abs_value(value, minimum, maximum)
+                self.axes[code] = normalized
+                events.append((t_ms, "axis", code, normalized, False))
+            elif event_type == EV_KEY:
+                self.buttons[code] = value
+                events.append((t_ms, "button", code, value, False))
+        return events
+
+
+def open_input_device(device):
+    real = os.path.basename(os.path.realpath(device))
+    if real.startswith("event"):
+        return LinuxEventJoystick(device)
+    return LinuxJoystick(device)
+
+
 def axis_to_rc(value, invert=False):
     if invert:
         value = -value
@@ -163,8 +263,74 @@ def apply_forced_mode_pwm(channels, value):
     return channels
 
 
+def apply_forced_channel_pwm(channels, channel, value):
+    """Force one RC channel when a physical switch is absent or not mapped yet."""
+    if value is None:
+        return channels
+    channels[channel] = clamp_rc(value)
+    return channels
+
+
+def apply_yaw_authority(channels, limit):
+    """Clamp yaw stick to center +/- limit (us). This plant spins on any
+    sustained yaw beyond ~+/-10 us even at a stable yaw rate-PID (measured
+    2026-07-04), so limiting the yaw the pilot can command keeps manual RC in
+    the stable window. limit <= 0 disables the clamp."""
+    if not limit or limit <= 0:
+        return channels
+    channels[YAW_CH] = clamp_rc(max(1500 - limit, min(1500 + limit, channels[YAW_CH])))
+    return channels
+
+
 def pack_rc_packet(channels):
     return struct.pack("<d16H", time.time(), *channels)
+
+
+class JsonlLogger:
+    def __init__(self, path):
+        self.path = Path(path) if path else None
+        self.handle = None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = self.path.open("w", encoding="utf-8")
+
+    def write(self, event, **fields):
+        if self.handle is None:
+            return
+        record = {"event": event, **fields}
+        self.handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self.handle.flush()
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+def event_records(events):
+    return [
+        {
+            "time_ms": t_ms,
+            "kind": kind,
+            "index": number,
+            "value": value,
+            "init": is_init,
+        }
+        for t_ms, kind, number, value, is_init in events
+    ]
+
+
+def rc_snapshot(joystick, channels, events, send_count):
+    return {
+        "time": time.time(),
+        "device": joystick.device,
+        "axes": {str(index): value for index, value in sorted(joystick.axes.items())},
+        "buttons": {str(index): value for index, value in sorted(joystick.buttons.items())},
+        "channels": list(channels),
+        "channels8": list(channels[:8]),
+        "events": event_records(events),
+        "send_count": send_count,
+    }
 
 
 def print_events(events):
@@ -200,12 +366,14 @@ def print_state(joystick, channels=None):
 
 
 def run(args):
-    joystick = LinuxJoystick(args.device)
+    joystick = open_input_device(args.device)
     joystick.open()
     sock = None
+    logger = JsonlLogger(args.log_jsonl)
     send_count = 0
     next_send = time.monotonic()
     next_print = time.monotonic()
+    next_log = time.monotonic()
     deadline = None if args.duration <= 0 else time.monotonic() + args.duration
     period = 1.0 / args.rate_hz
     print_period = 1.0 / args.print_hz
@@ -216,6 +384,16 @@ def run(args):
     print("device=%s host=%s port=%d rate=%.1fHz" %
           (args.device, args.host, args.port, args.rate_hz))
     print("Move sticks/switches to identify axes/buttons. Ctrl-C to quit.")
+    logger.write(
+        "session_start",
+        device=args.device,
+        host=args.host,
+        port=args.port,
+        rate_hz=args.rate_hz,
+        force_mode_pwm=args.force_mode_pwm,
+        force_arm_pwm=args.force_arm_pwm,
+        force_kenet_pwm=args.force_kenet_pwm,
+    )
 
     try:
         while True:
@@ -230,6 +408,9 @@ def run(args):
 
             channels = make_channels(joystick, CHANNEL_MAP)
             apply_forced_mode_pwm(channels, args.force_mode_pwm)
+            apply_forced_channel_pwm(channels, ARM_CH, args.force_arm_pwm)
+            apply_forced_channel_pwm(channels, KENET_STATE_CH, args.force_kenet_pwm)
+            apply_yaw_authority(channels, args.yaw_authority)
 
             now = time.monotonic()
             if args.send and now >= next_send:
@@ -252,12 +433,17 @@ def run(args):
                 print_state(joystick, channels)
                 next_print = now + print_period
 
+            if args.log_jsonl and (events or now >= next_log):
+                logger.write("rc_sample", **rc_snapshot(joystick, channels, events, send_count))
+                next_log = now + print_period
+
             time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     finally:
         if sock:
             sock.close()
+        logger.close()
         joystick.close()
 
 
@@ -287,6 +473,16 @@ def parse_args():
                         help="Stop after N seconds; 0 means run until Ctrl-C")
     parser.add_argument("--force-mode-pwm", type=int, default=None,
                         help="Force CH7/AUX3 to this PWM value, e.g. 1500 for ANGLE mode tests")
+    parser.add_argument("--force-arm-pwm", type=int, default=None,
+                        help="Force CH5/AUX1 ARM to this PWM value when the physical ARM switch is absent")
+    parser.add_argument("--force-kenet-pwm", type=int, default=None,
+                        help="Force CH6/AUX2 Kenet state to this PWM value when the physical state switch is absent")
+    parser.add_argument("--yaw-authority", type=int, default=0,
+                        help="Clamp yaw stick to center +/- this (us). 0 = no "
+                             "clamp. Small value (e.g. 10) keeps manual RC yaw "
+                             "in the stable window; the plant spins on real yaw.")
+    parser.add_argument("--log-jsonl",
+                        help="Write raw joystick axes/buttons and RC channels to this JSONL file")
     args = parser.parse_args()
     if not args.dry_run and not args.send and not args.events and not args.changes:
         parser.error("choose --dry-run, --send, --events, and/or --changes")
@@ -296,6 +492,12 @@ def parse_args():
         parser.error("--print-hz must be positive")
     if args.force_mode_pwm is not None and not 1000 <= args.force_mode_pwm <= 2000:
         parser.error("--force-mode-pwm must be between 1000 and 2000")
+    if args.yaw_authority < 0:
+        parser.error("--yaw-authority must be >= 0")
+    if args.force_arm_pwm is not None and not 1000 <= args.force_arm_pwm <= 2000:
+        parser.error("--force-arm-pwm must be between 1000 and 2000")
+    if args.force_kenet_pwm is not None and not 1000 <= args.force_kenet_pwm <= 2000:
+        parser.error("--force-kenet-pwm must be between 1000 and 2000")
     return args
 
 

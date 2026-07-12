@@ -14,7 +14,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from sitl_rc_bridge import CHANNEL_MAP, LinuxJoystick, apply_forced_mode_pwm, make_channels  # noqa: E402
+from sitl_rc_bridge import CHANNEL_MAP, apply_forced_mode_pwm, make_channels, open_input_device  # noqa: E402
 from sitl_rc_channels import ARM_CH, AUTOPILOT_MODE_CHANNEL, KENET_STATE_CH, channel_label  # noqa: E402
 
 
@@ -106,7 +106,7 @@ def evaluate_switch_observations(
 
 
 def collect_observations(args: argparse.Namespace) -> dict[int, set[str]]:
-    joystick = LinuxJoystick(args.device)
+    joystick = open_input_device(args.device)
     joystick.open()
     deadline = time.monotonic() + args.duration
     observed: dict[int, set[str]] = {item["channel"]: set() for item in SWITCH_EXPECTATIONS}

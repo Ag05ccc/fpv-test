@@ -105,6 +105,22 @@ def summarize(paths: list[Path]) -> dict:
                     "path": str(path),
                 })
 
+            if event == "motor_udp_sample":
+                dash = stats["dashboard"]
+                dash["samples"] += 1
+                motor = (record.get("motors_raw") or [])[:4]
+                motor_values = [numeric_or_none(value) for value in motor]
+                if len(motor_values) >= 2 and all(value is not None for value in motor_values):
+                    dash["motor_samples"] += 1
+                    spread = max(motor_values) - min(motor_values)
+                    current = dash["max_motor_spread"]
+                    if current is None or spread > current["value"]:
+                        dash["max_motor_spread"] = {
+                            "value": spread,
+                            "motors": motor,
+                            "time_iso": record.get("time_iso"),
+                        }
+
             if event in ("dashboard_sample", "diagnostic_sample", "manual_marker"):
                 dash = stats["dashboard"]
                 dash["samples"] += 1
@@ -234,6 +250,63 @@ def print_top_map(title: str, values: dict, limit: int = 8) -> None:
         ))
 
 
+def compact_number(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        if abs(value - round(value)) < 0.05:
+            return str(int(round(value)))
+        return "%.1f" % value
+    return str(value)
+
+
+def path_verdict(dash: dict) -> str:
+    if not dash["attitude_samples"] and not dash["motor_samples"]:
+        return "NO_DATA"
+    roll = dash["max_roll"]["value"] if dash["max_roll"] else 0
+    pitch = dash["max_pitch"]["value"] if dash["max_pitch"] else 0
+    attitude_abs = max(abs(roll), abs(pitch))
+    spread = dash["max_motor_spread"]["value"] if dash["max_motor_spread"] else 0
+    if attitude_abs >= 60 or spread >= 400:
+        return "FAIL"
+    if attitude_abs >= 35 or spread >= 250:
+        return "WARN"
+    return "PASS"
+
+
+def print_per_path_summary(paths: list[Path]) -> None:
+    rows = []
+    for path in paths:
+        dash = summarize([path])["dashboard"]
+        yaw_delta = dash["max_channel_delta"].get("Yaw", {}).get("value")
+        rows.append({
+            "path": str(path),
+            "verdict": path_verdict(dash),
+            "samples": dash["samples"],
+            "armed": dash["armed"].get("True", 0),
+            "msp_offline": dash["msp_offline"],
+            "max_roll": dash["max_roll"]["value"] if dash["max_roll"] else None,
+            "max_pitch": dash["max_pitch"]["value"] if dash["max_pitch"] else None,
+            "max_spread": dash["max_motor_spread"]["value"] if dash["max_motor_spread"] else None,
+            "yaw_delta": yaw_delta,
+        })
+    columns = [
+        ("path", "path"),
+        ("verdict", "verdict"),
+        ("samples", "samples"),
+        ("armed", "armed"),
+        ("msp_offline", "msp_offline"),
+        ("max_roll", "max_roll"),
+        ("max_pitch", "max_pitch"),
+        ("max_spread", "max_spread"),
+        ("yaw_delta", "yaw_delta"),
+    ]
+    print("| " + " | ".join(header for _, header in columns) + " |")
+    print("| " + " | ".join("---" for _ in columns) + " |")
+    for row in rows:
+        print("| " + " | ".join(compact_number(row.get(key)) for key, _ in columns) + " |")
+
+
 def print_summary(stats: dict) -> None:
     print("SITL log summary")
     print("paths:")
@@ -319,6 +392,8 @@ def parse_args() -> argparse.Namespace:
                         help="Log directory; default logs/sitl")
     parser.add_argument("--latest", type=int, default=5,
                         help="When no paths are supplied, analyze latest N JSONL files")
+    parser.add_argument("--per-path", action="store_true",
+                        help="Print one compact verdict row for each JSONL path")
     return parser.parse_args()
 
 
@@ -334,7 +409,10 @@ def main() -> int:
     if missing:
         print("missing logs: %s" % ", ".join(missing))
         return 2
-    print_summary(summarize(paths))
+    if args.per_path:
+        print_per_path_summary(paths)
+    else:
+        print_summary(summarize(paths))
     return 0
 
 

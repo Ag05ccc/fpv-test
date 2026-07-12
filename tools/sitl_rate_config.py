@@ -128,26 +128,35 @@ def encode_rate_payload(config: dict[str, Any]) -> bytes:
 def update_rate_config(
     config: dict[str, Any],
     *,
-    yaw_rc_rate: int | None = None,
-    yaw_rate: int | None = None,
-    yaw_rate_limit: int | None = None,
+    roll_rc_rate: int | None = None,
+    roll_rate: int | None = None,
+    roll_rate_limit: int | None = None,
     pitch_rc_rate: int | None = None,
     pitch_rate: int | None = None,
     pitch_rate_limit: int | None = None,
+    yaw_rc_rate: int | None = None,
+    yaw_rate: int | None = None,
+    yaw_rate_limit: int | None = None,
 ) -> dict[str, Any]:
     updated = dict(config)
-    if yaw_rc_rate is not None:
-        updated["yaw_rc_rate"] = yaw_rc_rate
-    if yaw_rate is not None:
-        updated["yaw_rate"] = yaw_rate
-    if yaw_rate_limit is not None:
-        updated["yaw_rate_limit"] = yaw_rate_limit
+    if roll_rc_rate is not None:
+        updated["roll_rc_rate"] = roll_rc_rate
+    if roll_rate is not None:
+        updated["roll_rate"] = roll_rate
+    if roll_rate_limit is not None:
+        updated["roll_rate_limit"] = roll_rate_limit
     if pitch_rc_rate is not None:
         updated["pitch_rc_rate"] = pitch_rc_rate
     if pitch_rate is not None:
         updated["pitch_rate"] = pitch_rate
     if pitch_rate_limit is not None:
         updated["pitch_rate_limit"] = pitch_rate_limit
+    if yaw_rc_rate is not None:
+        updated["yaw_rc_rate"] = yaw_rc_rate
+    if yaw_rate is not None:
+        updated["yaw_rate"] = yaw_rate
+    if yaw_rate_limit is not None:
+        updated["yaw_rate_limit"] = yaw_rate_limit
     return updated
 
 
@@ -157,19 +166,21 @@ def read_rate_config(host: str, port: int, timeout: float) -> dict[str, Any]:
 
 def format_rate_config(label: str, config: dict[str, Any]) -> str:
     return (
-        "%s yaw_rc_rate=%s yaw_rate=%s yaw_rate_limit=%s "
+        "%s roll_rc_rate=%s roll_rate=%s roll_rate_limit=%s "
         "pitch_rc_rate=%s pitch_rate=%s pitch_rate_limit=%s "
-        "roll_limit=%s pitch_limit=%s rates_type=%s"
+        "yaw_rc_rate=%s yaw_rate=%s yaw_rate_limit=%s "
+        "rates_type=%s"
     ) % (
         label,
-        config.get("yaw_rc_rate", "-"),
-        config.get("yaw_rate", "-"),
-        config.get("yaw_rate_limit", "-"),
+        config.get("roll_rc_rate", "-"),
+        config.get("roll_rate", "-"),
+        config.get("roll_rate_limit", "-"),
         config.get("pitch_rc_rate", "-"),
         config.get("pitch_rate", "-"),
         config.get("pitch_rate_limit", "-"),
-        config.get("roll_rate_limit", "-"),
-        config.get("pitch_rate_limit", "-"),
+        config.get("yaw_rc_rate", "-"),
+        config.get("yaw_rate", "-"),
+        config.get("yaw_rate_limit", "-"),
         config.get("rates_type", "-"),
     )
 
@@ -199,16 +210,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5761)
     parser.add_argument("--timeout", type=float, default=2.0)
-    parser.add_argument("--yaw-rc-rate", type=parse_byte_value, default=None)
-    parser.add_argument("--yaw-rate", type=parse_byte_value, default=None,
-                        help="Betaflight yaw super-rate value")
-    parser.add_argument("--yaw-rate-limit", type=parse_u16_value, default=None,
-                        help="Betaflight yaw rate_limit in deg/s; 0 disables limit")
+    parser.add_argument("--roll-rc-rate", type=parse_byte_value, default=None)
+    parser.add_argument("--roll-rate", type=parse_byte_value, default=None,
+                        help="Betaflight roll super-rate value")
+    parser.add_argument("--roll-rate-limit", type=parse_u16_value, default=None,
+                        help="Betaflight roll rate_limit in deg/s; 0 disables limit")
     parser.add_argument("--pitch-rc-rate", type=parse_byte_value, default=None)
     parser.add_argument("--pitch-rate", type=parse_byte_value, default=None,
                         help="Betaflight pitch super-rate value")
     parser.add_argument("--pitch-rate-limit", type=parse_u16_value, default=None,
                         help="Betaflight pitch rate_limit in deg/s; 0 disables limit")
+    parser.add_argument("--yaw-rc-rate", type=parse_byte_value, default=None)
+    parser.add_argument("--yaw-rate", type=parse_byte_value, default=None,
+                        help="Betaflight yaw super-rate value")
+    parser.add_argument("--yaw-rate-limit", type=parse_u16_value, default=None,
+                        help="Betaflight yaw rate_limit in deg/s; 0 disables limit")
     parser.add_argument("--save", action="store_true", help="Persist with MSP_EEPROM_WRITE")
     return parser.parse_args()
 
@@ -218,22 +234,28 @@ def main() -> int:
     before = read_rate_config(args.host, args.port, args.timeout)
     print(format_rate_config("before", before))
     fields = (
-        "yaw_rc_rate",
-        "yaw_rate",
-        "yaw_rate_limit",
+        "roll_rc_rate",
+        "roll_rate",
+        "roll_rate_limit",
         "pitch_rc_rate",
         "pitch_rate",
         "pitch_rate_limit",
+        "yaw_rc_rate",
+        "yaw_rate",
+        "yaw_rate_limit",
     )
     if any(getattr(args, key) is not None for key in fields):
         desired = update_rate_config(
             before,
-            yaw_rc_rate=args.yaw_rc_rate,
-            yaw_rate=args.yaw_rate,
-            yaw_rate_limit=args.yaw_rate_limit,
+            roll_rc_rate=args.roll_rc_rate,
+            roll_rate=args.roll_rate,
+            roll_rate_limit=args.roll_rate_limit,
             pitch_rc_rate=args.pitch_rc_rate,
             pitch_rate=args.pitch_rate,
             pitch_rate_limit=args.pitch_rate_limit,
+            yaw_rc_rate=args.yaw_rc_rate,
+            yaw_rate=args.yaw_rate,
+            yaw_rate_limit=args.yaw_rate_limit,
         )
         msp_command(args.host, args.port, MSP_SET_RC_TUNING, encode_rate_payload(desired), args.timeout)
         after = read_rate_config(args.host, args.port, args.timeout)

@@ -1,0 +1,143 @@
+diff --git a/plugins/BetaflightPlugin.cc b/plugins/BetaflightPlugin.cc
+index c73515d..40042cf 100644
+--- a/plugins/BetaflightPlugin.cc
++++ b/plugins/BetaflightPlugin.cc
+@@ -56,6 +56,10 @@ typedef SSIZE_T ssize_t;
+ #include <gz/sim/components/Joint.hh>
+ #include <gz/sim/components/JointForceCmd.hh>
+ #include <gz/sim/components/JointVelocity.hh>
++// KENET_ROTOR_VELOCITY_CONTROL_BEGIN
++#include <cmath>
++#include <gz/sim/components/JointVelocityCmd.hh>
++// KENET_ROTOR_VELOCITY_CONTROL_END
+ #include <gz/sim/components/LinearAcceleration.hh>
+ #include <gz/sim/components/LinearVelocity.hh>
+ #include <gz/sim/components/Name.hh>
+@@ -159,6 +163,22 @@ class Rotor
+   /// \brief Max rotor propeller RPM.
+   public: double maxRpm = 838.0;
+ 
++  // KENET_ROTOR_VELOCITY_CONTROL_BEGIN
++  /// \brief When true, drive the joint with a velocity command (first-order
++  /// response with motorTimeConstant) instead of the force PID. The force
++  /// PID with vel_p_gain=0.05 is a weak, laggy actuator whose closed-loop
++  /// behavior with Betaflight is physics-step dependent; velocity control
++  /// models a fast ESC/motor servo.
++  public: bool velocityControl = false;
++
++  /// \brief First-order motor response time constant in seconds for
++  /// velocity-control mode. 0 means the joint tracks the target instantly.
++  public: double motorTimeConstant = 0.0;
++
++  /// \brief Internal first-order velocity state for velocity-control mode.
++  public: double velState = 0.0;
++  // KENET_ROTOR_VELOCITY_CONTROL_END
++
+   /// \brief Next command to be applied to the propeller
+   public: double cmd = 0;
+ 
+@@ -501,18 +521,57 @@ void BetaflightPlugin::Configure(const Entity &_entity,
+       // set pid initial command
+       rotor.pid.SetCmd(0.0);
+ 
++      // KENET_ROTOR_VELOCITY_CONTROL_BEGIN
++      getSdfParam<double>(rotorSDF, "maxRotorVelocity",
++          rotor.maxRpm, rotor.maxRpm);
++      {
++        bool velocityControl = rotor.velocityControl;
++        getSdfParam<bool>(rotorSDF, "velocityControl",
++            velocityControl, velocityControl);
++        rotor.velocityControl = velocityControl;
++      }
++      getSdfParam<double>(rotorSDF, "motorTimeConstant",
++          rotor.motorTimeConstant, rotor.motorTimeConstant);
++      if (rotor.motorTimeConstant < 0.0)
++      {
++        gzerr << "rotor for joint [" << rotor.jointName
++              << "] motorTimeConstant must be >= 0, using 0.\n";
++        rotor.motorTimeConstant = 0.0;
++      }
++      if (rotor.velocityControl)
++      {
++        gzdbg << "rotor for joint [" << rotor.jointName
++              << "] using velocity control, motorTimeConstant="
++              << rotor.motorTimeConstant << " maxRotorVelocity="
++              << rotor.maxRpm << "\n";
++      }
++      // KENET_ROTOR_VELOCITY_CONTROL_END
++
+       // Create joint velocity component if it doesn't exist
+       if (!_ecm.Component<components::JointVelocity>(rotor.jointEntity))
+       {
+         _ecm.CreateComponent(rotor.jointEntity, components::JointVelocity());
+       }
+ 
+-      // Create joint force command component if it doesn't exist
+-      if (!_ecm.Component<components::JointForceCmd>(rotor.jointEntity))
++      // KENET_ROTOR_VELOCITY_CONTROL_BEGIN
++      // In velocity-control mode the joint must NOT carry a JointForceCmd:
++      // a lingering zero-force command keeps the dartsim actuator in FORCE
++      // mode and the velocity servo never engages (measured: rotors stand
++      // still). Only create the component needed for the selected mode.
++      if (rotor.velocityControl)
++      {
++        if (!_ecm.Component<components::JointVelocityCmd>(rotor.jointEntity))
++        {
++          _ecm.CreateComponent(rotor.jointEntity,
++                              components::JointVelocityCmd({0.0}));
++        }
++      }
++      else if (!_ecm.Component<components::JointForceCmd>(rotor.jointEntity))
+       {
+         _ecm.CreateComponent(rotor.jointEntity,
+                             components::JointForceCmd({0.0}));
+       }
++      // KENET_ROTOR_VELOCITY_CONTROL_END
+ 
+       this->dataPtr->rotors.push_back(rotor);
+       rotorSDF = rotorSDF->GetNextElement("rotor");
+@@ -602,6 +661,9 @@ void BetaflightPluginPrivate::ResetPIDs()
+   for (size_t i = 0; i < this->rotors.size(); ++i)
+   {
+     this->rotors[i].cmd = 0;
++    // KENET_ROTOR_VELOCITY_CONTROL_BEGIN
++    this->rotors[i].velState = 0.0;
++    // KENET_ROTOR_VELOCITY_CONTROL_END
+     // this->rotors[i].pid.Reset();
+   }
+ }
+@@ -617,6 +679,34 @@ void BetaflightPluginPrivate::ApplyMotorForces(const double _dt,
+       this->rotors[i].cmd /
+       this->rotors[i].rotorVelocitySlowdownSim;
+ 
++    // KENET_ROTOR_VELOCITY_CONTROL_BEGIN
++    if (this->rotors[i].velocityControl)
++    {
++      // Defensive: a JointForceCmd on the same joint would flip the dartsim
++      // actuator back to FORCE mode and starve the velocity servo.
++      if (_ecm.Component<components::JointForceCmd>(
++              this->rotors[i].jointEntity))
++      {
++        _ecm.RemoveComponent<components::JointForceCmd>(
++            this->rotors[i].jointEntity);
++      }
++      const double tau = this->rotors[i].motorTimeConstant;
++      if (tau > 0.0 && _dt > 0.0)
++      {
++        const double alpha = 1.0 - std::exp(-_dt / tau);
++        this->rotors[i].velState +=
++            alpha * (velTarget - this->rotors[i].velState);
++      }
++      else
++      {
++        this->rotors[i].velState = velTarget;
++      }
++      _ecm.SetComponentData<components::JointVelocityCmd>(
++          this->rotors[i].jointEntity, {this->rotors[i].velState});
++      continue;
++    }
++    // KENET_ROTOR_VELOCITY_CONTROL_END
++
+     // Get joint velocity (treat missing/empty data as zero velocity)
+     double vel = 0.0;
+     auto jointVelComp = _ecm.Component<components::JointVelocity>(

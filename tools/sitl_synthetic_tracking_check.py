@@ -121,6 +121,8 @@ def build_checker_command(args: argparse.Namespace, diagnostics_log: Path) -> li
         "--min-altitude-gain", str(args.min_altitude_gain),
         "--diagnostics-log-file", str(diagnostics_log),
     ]
+    if args.max_step_size is not None:
+        command.extend(["--max-step-size", args.max_step_size])
     if args.no_fix_iris_imu_pose:
         command.append("--no-fix-iris-imu-pose")
     if args.no_fix_iris_motor_map:
@@ -294,6 +296,18 @@ def validate_mixer_summary(summary: dict[str, Any], args: argparse.Namespace) ->
         failures.append("tracker error: %s" % "; ".join(summary["tracker_errors"]))
     if args.max_abs_delta is not None and summary["max_abs_delta"] > args.max_abs_delta:
         failures.append("mixer delta limiti asildi: %s > %s" % (summary["max_abs_delta"], args.max_abs_delta))
+    if args.min_abs_pitch_delta is not None and summary["max_abs_pitch_delta"] < args.min_abs_pitch_delta:
+        failures.append(
+            "pitch delta yetersiz: %s < %s" % (summary["max_abs_pitch_delta"], args.min_abs_pitch_delta)
+        )
+    if args.min_abs_yaw_delta is not None and summary["max_abs_yaw_delta"] < args.min_abs_yaw_delta:
+        failures.append("yaw delta yetersiz: %s < %s" % (summary["max_abs_yaw_delta"], args.min_abs_yaw_delta))
+    if args.max_abs_pitch_delta is not None and summary["max_abs_pitch_delta"] > args.max_abs_pitch_delta:
+        failures.append(
+            "pitch delta limiti asildi: %s > %s" % (summary["max_abs_pitch_delta"], args.max_abs_pitch_delta)
+        )
+    if args.max_abs_yaw_delta is not None and summary["max_abs_yaw_delta"] > args.max_abs_yaw_delta:
+        failures.append("yaw delta limiti asildi: %s > %s" % (summary["max_abs_yaw_delta"], args.max_abs_yaw_delta))
     return failures
 
 
@@ -435,6 +449,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checker-timeout", type=float, default=300.0)
     parser.add_argument("--max-abs-attitude", type=float, default=35.0)
     parser.add_argument("--min-altitude-gain", type=float, default=1.0)
+    parser.add_argument("--max-step-size", default=None,
+                        help="Optional Gazebo physics step passed to the external checker, e.g. 0.001 or 0.0025. "
+                             "Default keeps the external checker's own default; command-response brackets are "
+                             "step-dependent, so record the effective step with the evidence.")
     parser.add_argument("--safe-yaw-authority", action="store_true", default=True)
     parser.add_argument("--no-safe-yaw-authority", action="store_false", dest="safe_yaw_authority")
     parser.add_argument("--yaw-pid", default=None,
@@ -456,6 +474,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-ai-armed-samples", type=int, default=0)
     parser.add_argument("--max-abs-delta", type=int, default=None,
                         help="Optional mixer delta limit; use 0 for centered no-command acceptance")
+    parser.add_argument("--min-abs-pitch-delta", type=int, default=None,
+                        help="Require the mixer to command at least this pitch delta")
+    parser.add_argument("--min-abs-yaw-delta", type=int, default=None,
+                        help="Require the mixer to command at least this yaw delta")
+    parser.add_argument("--max-abs-pitch-delta", type=int, default=None,
+                        help="Optional pitch-axis command ceiling")
+    parser.add_argument("--max-abs-yaw-delta", type=int, default=None,
+                        help="Optional yaw-axis command ceiling")
 
     args = parser.parse_args(argv)
     if not 1000 <= args.throttle <= 2000:
@@ -513,6 +539,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--%s must be non-negative" % name.replace("_", "-"))
     if args.max_abs_delta is not None and args.max_abs_delta < 0:
         parser.error("--max-abs-delta must be non-negative")
+    for name in ("min_abs_pitch_delta", "min_abs_yaw_delta", "max_abs_pitch_delta", "max_abs_yaw_delta"):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            parser.error("--%s must be non-negative" % name.replace("_", "-"))
     for name in ("pitch_rc_rate", "pitch_rate"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 255:

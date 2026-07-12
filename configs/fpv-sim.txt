@@ -1,0 +1,31 @@
+# FPV manual-flight SITL config.
+#
+# Merges the SITL-required arming/motor essentials with the acceptance-proven
+# roll P-only flight tune. The launcher imports this into the SITL eeprom
+# before starting Betaflight so a human can arm and fly reliably.
+#
+# Why small_angle=180: in SITL the accelerometer can take a moment to report a
+# clean gravity vector, and until it does Betaflight cannot confirm the craft
+# is level, so it holds the ANGLE arming-disable and refuses to arm even on a
+# perfectly level drone. small_angle=180 bypasses the tilt check entirely (the
+# same thing sitl_config.txt does), so arming is not blocked by that timing.
+# feature -3D + motor_pwm_protocol=PWM are the other SITL essentials (3D mode
+# makes throttle-center = motors off; DSHOT is not supported in SITL).
+
+# --- Arming safety / SITL essentials (from sitl_config.txt) ---
+feature -3D
+set motor_pwm_protocol = PWM
+set motor_pwm_rate = 480
+set small_angle = 180
+set runaway_takeoff_prevention = OFF
+
+# --- Measured flight tune (from sync-tune-allaxis-p23.txt) ---
+set p_roll = 23
+set i_roll = 0
+set d_roll = 0
+set roll_rc_rate = 5
+set roll_srate = 30
+set roll_rate_limit = 120
+set pitch_rc_rate = 5
+set pitch_srate = 30
+set pitch_rate_limit = 120

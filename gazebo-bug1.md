@@ -1911,3 +1911,47 @@ Buradan devam:
 10. Fiziksel RC veya Kenet mixer RC gönderirken kabul testi şu modla koşulacak:
    `python tools/sitl_virtual_takeoff_check.py --rc-driver external --throttle 1750`.
 ```
+
+---
+
+## 2026-07-02 — Zamanlama/Lockstep Hipotezinin Kapanışı (ölçüldü)
+
+Bu dosyadaki "Kök Neden: Gazebo ↔ Betaflight Zaman Senkronizasyonu" hipotezi
+(0.004 step + RTF ~1.31 + simRate kayması → PID dt tutarsızlığı) log ve kod
+doğrulamasıyla test edildi ve **çürütüldü**:
+
+- RTF incelenen her koşuda ~1.000 (min 0.9935, max 1.0013), lockstep öncesi
+  `flipfix-baseline` dahil. RTF 1.31 hiçbir güncel logda yok.
+- Motor UDP kadansı metronomik (0.0025 step → 400 Hz, 0.001 → ~997 Hz) ve
+  PASS/FAIL koşularında istatistiksel olarak aynı (P21 PASS: mean 2.501 ms,
+  sd 0.257; P23 FAIL: mean 2.500 ms, sd 0.243). Hiçbir paket boşluğu split'e
+  öncülük etmiyor; büyük boşluklar crash SONRASI geliyor.
+- Lockstep (`ENABLE_SIMULATOR_GYROPID_SYNC`, commit `f11faf414`) hiçbir FAIL
+  vakasını PASS yapmadı; neutral zaten lockstep öncesinde de PASS'ti. Commit
+  mesajındaki "primary driver" iddiası loglarla desteklenmiyor.
+- Mekanizma notu: lockstep bloklamalı bekleme değil trylock-atla
+  (`core.c` `lockMainPID`, `sitl.c` trylock/unlock). FDM başına en fazla 1 PID
+  iterasyonu; motor paketi her build'de FDM başına 1 (`updateLock`). SITL
+  saati simRate ile ölçeklenmiş duvar saatidir; Gazebo durursa motor çıkışı
+  süresiz donar ama failsafe/MSP zamanlayıcıları ilerler (yapısal risk, mevcut
+  flip'in nedeni değil).
+- Step boyutu sınırı kaydırıyor ama yaw'ı kurtarmıyor: 0.001'de pitch1510/1522
+  PASS (spread 3.1/13.0 µs), P23/yaw1504 hâlâ FAIL (nudge sonrası split
+  0.877 s).
+- Motor ölçekleme şüphesi de çürütüldü: paket değeri `(PWM-1000)/1000`,
+  0.0–1.0 tam aralık; %20 otorite kaybı yok.
+
+Kalan kök neden: Gazebo iris aktüatör modeli (P-only rotor hız döngüsü
+`vel_p_gain=0.05`, plugin'de sabit `maxRpm=838` rad/s ölçeği) ile Betaflight
+varsayılan yaw otoritesinin kapalı çevrim uyumsuzluğu. Arıza yaw P kazancında
+ve setpoint büyüklüğünde monoton (P21 PASS / P22 sınır / P23 FAIL; yaw1503
+PASS / yaw1504 FAIL); `yaw_rate_limit=120` setpoint'i rampalayıp rotor
+döngüsünü lineer tutarak P23'ü PASS yapıyor.
+
+Ayrıca ölçülen ikincil bulgu: koşular arası durum sızıntısı
+(`20260630-235335-bracket-pitch1515` ilk örnekte roll `-180`, hiç arm olmadı;
+`flipfix-yaw1650-rev/fixed` hiç arm olmadı → bu koşular kanıt değil INVALID).
+Koşu geçerliliği kuralları ve ölçülebilir kabul kriterleri:
+`docs/sitl-flight-readiness-criteria.md`. Bu dosyanın 8–10. maddelerindeki
+"fiziksel RC yeniden eklenecek" planı da güncellendi: 2026-07-02 kararıyla
+fiziksel RC tamamen opsiyoneldir ve hiçbir kapının ön şartı değildir.

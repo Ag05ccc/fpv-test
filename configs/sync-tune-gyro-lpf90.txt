@@ -1,0 +1,6 @@
+# Sim-specific tune probe: extra gyro smoothing for the truthful-timing
+# (looptime-sync) world. The historical 0.0025 stability rode on the timing
+# bug's accidental ~1/20-cutoff over-filtering; this applies a deliberate,
+# correctly scaled version of the same idea. Debug evidence only, not a
+# real-flight tune.
+set gyro_lpf1_static_hz = 90

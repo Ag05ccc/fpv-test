@@ -1,0 +1,94 @@
+diff --git a/src/platform/SIMULATOR/sitl.c b/src/platform/SIMULATOR/sitl.c
+index f765f599a..ae3867b0d 100644
+--- a/src/platform/SIMULATOR/sitl.c
++++ b/src/platform/SIMULATOR/sitl.c
+@@ -90,6 +90,20 @@ static bool workerRunning = true;
+ static udpLink_t stateLink, pwmLink, pwmRawLink, rcLink;
+ static pthread_mutex_t updateLock;
+ static pthread_mutex_t mainLoopLock;
++// KENET_SITL_LOCKSTEP_SEM_BEGIN
++// Counting semaphore for the GYROPID_SYNC wakeup. The stock pattern
++// (mutex unlock from udpThread + trylock in taskMainPidLoop) loses wakeups:
++// unlocking an already-unlocked mutex is a no-op, so when the PID task is
++// not parked exactly at the trylock when the FDM packet lands, that packet's
++// iteration is skipped. At coarse steps the task attempts ~25x per packet and
++// this never bites, but when the task period approaches the packet period
++// (e.g. KENET_SITL_LOOPTIME_US=1000 at a 1 ms step) the phase race skips
++// most iterations, motor packets stall, and Gazebo crawls. A semaphore
++// counts pending packets instead of losing them (clamped to 2 so stale
++// backlog cannot accumulate while disarmed/paused).
++#include <semaphore.h>
++static sem_t mainLoopSem;
++// KENET_SITL_LOCKSTEP_SEM_END
+ static char simulator_ip[32] = "127.0.0.1";
+ 
+ #ifdef CONFIG_IN_FILE
+@@ -155,7 +169,39 @@ int timeval_sub(struct timespec *result, struct timespec *x, struct timespec *y)
+ 
+ int lockMainPID(void)
+ {
+-    return pthread_mutex_trylock(&mainLoopLock);
++// KENET_SITL_LOCKSTEP_SEM_BEGIN
++    // Optional bounded wait (KENET_SITL_LOCKSTEP_WAIT_US, microseconds).
++    // At fine steps the gyro task period approaches the FDM packet period, so
++    // a pure trylock burns the task's scheduler slot whenever it fires just
++    // before the packet lands and the loop runs at a fraction of the FDM
++    // cadence. Blocking briefly for the packet removes that phase race while
++    // still bounding the stall if the simulator pauses, unlike the tasks.c
++    // fast-retry hack that starved MSP. Env unset or 0 keeps the stock
++    // trylock behavior bit-for-bit.
++    static long lockstepWaitUs = -1;
++    if (lockstepWaitUs < 0) {
++        const char *waitEnv = getenv("KENET_SITL_LOCKSTEP_WAIT_US");
++        lockstepWaitUs = waitEnv ? atol(waitEnv) : 0;
++        if (lockstepWaitUs < 0 || lockstepWaitUs > 1000000) {
++            fprintf(stderr, "[SITL] Ignoring invalid KENET_SITL_LOCKSTEP_WAIT_US=%s (valid 1..1000000)\n",
++                    waitEnv ? waitEnv : "");
++            lockstepWaitUs = 0;
++        } else if (lockstepWaitUs > 0) {
++            printf("[SITL] Lockstep bounded wait: KENET_SITL_LOCKSTEP_WAIT_US=%ld\n", lockstepWaitUs);
++        }
++    }
++    if (lockstepWaitUs == 0) {
++        return sem_trywait(&mainLoopSem);
++    }
++    struct timespec deadline;
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    deadline.tv_nsec += lockstepWaitUs * 1000L;
++    while (deadline.tv_nsec >= 1000000000L) {
++        deadline.tv_sec += 1;
++        deadline.tv_nsec -= 1000000000L;
++    }
++    return sem_timedwait(&mainLoopSem, &deadline);
++// KENET_SITL_LOCKSTEP_SEM_END
+ }
+ 
+ #define RAD2DEG (180.0 / M_PI)
+@@ -270,7 +316,15 @@ static void updateState(const fdm_packet* pkt)
+     pthread_mutex_unlock(&updateLock); // can send PWM output now
+ 
+ #if ENABLE_SIMULATOR_GYROPID_SYNC
+-    pthread_mutex_unlock(&mainLoopLock); // can run main loop
++// KENET_SITL_LOCKSTEP_SEM_BEGIN
++    {
++        int pending = 0;
++        sem_getvalue(&mainLoopSem, &pending);
++        if (pending < 2) {
++            sem_post(&mainLoopSem); // can run main loop, wakeups are counted
++        }
++    }
++// KENET_SITL_LOCKSTEP_SEM_END
+ #endif
+ }
+ 
+@@ -367,6 +421,10 @@ void systemInit(void)
+ 
+     if (pthread_mutex_init(&mainLoopLock, NULL) != 0) {
+         printf("Create mainLoopLock error!\n");
++    }
++// KENET_SITL_LOCKSTEP_SEM_BEGIN
++    if (sem_init(&mainLoopSem, 0, 0) != 0) {
++        printf("Create mainLoopSem error!\n");
+         exit(1);
+     }
+ 

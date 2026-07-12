@@ -14,6 +14,11 @@ fix_iris_imu_pose=0
 fix_iris_motor_map=0
 iris_yaw_gyro_scale=""
 iris_rotor_vel_p_gain=""
+iris_velocity_control=0
+iris_motor_time_constant=""
+iris_rotor_damping=""
+iris_forward_camera=0
+gui_config=""
 dry_run=0
 verbosity=4
 max_step_size=""
@@ -43,6 +48,30 @@ Options:
   --iris-rotor-vel-p-gain G
                      Use a temporary betaloop_iris_with_standoffs model copy
                      with all rotor <vel_p_gain> values set to G.
+  --iris-velocity-control
+                     Use a temporary betaloop_iris_with_standoffs model copy
+                     with <velocityControl>1</velocityControl> on every rotor:
+                     the plugin drives the joints with velocity commands
+                     (fast ESC/motor servo) instead of the weak force PID.
+  --iris-motor-time-constant T
+                     First-order rotor response time constant in seconds for
+                     velocity-control mode (<motorTimeConstant>T</...>).
+                     Implies nothing by itself; use with --iris-velocity-control.
+  --iris-rotor-damping D
+                     Use a temporary betaloop_iris_with_standoffs model copy
+                     with rotor_*_joint <damping> set to D. The stock 0.004
+                     gives ~1.8 N*m drag torque per rotor at hover, an
+                     unrealistically hot differential yaw authority; smaller
+                     values bring yaw authority toward real-quad scale.
+  --iris-forward-camera
+                     Use a temporary betaloop_iris_with_standoffs model copy
+                     with a forward-facing FPV camera sensor (negligible mass,
+                     fixed joint on base_link) publishing 640x480@30
+                     on topic /kenet/fpv_camera. Off by default so existing
+                     acceptance evidence keeps its render-free performance.
+  --gui-config PATH  Pass a Gazebo GUI config file (gz sim --gui-config).
+                     Ignored with --headless. tools/fpv_gui.config adds a
+                     docked ImageDisplay panel on /kenet/fpv_camera.
   --dry-run          Print the command and environment without launching Gazebo.
   --verbose LEVEL    Gazebo verbosity level. Default: 4
   -h, --help         Show this help.
@@ -101,6 +130,38 @@ while [ "$#" -gt 0 ]; do
         exit 2
       fi
       iris_rotor_vel_p_gain="$2"
+      shift 2
+      ;;
+    --iris-velocity-control)
+      iris_velocity_control=1
+      shift
+      ;;
+    --iris-motor-time-constant)
+      if [ "$#" -lt 2 ]; then
+        printf 'error: --iris-motor-time-constant requires a value\n' >&2
+        exit 2
+      fi
+      iris_motor_time_constant="$2"
+      shift 2
+      ;;
+    --iris-rotor-damping)
+      if [ "$#" -lt 2 ]; then
+        printf 'error: --iris-rotor-damping requires a value\n' >&2
+        exit 2
+      fi
+      iris_rotor_damping="$2"
+      shift 2
+      ;;
+    --iris-forward-camera)
+      iris_forward_camera=1
+      shift
+      ;;
+    --gui-config)
+      if [ "$#" -lt 2 ]; then
+        printf 'error: --gui-config requires a value\n' >&2
+        exit 2
+      fi
+      gui_config="$2"
       shift 2
       ;;
     --dry-run)
@@ -220,7 +281,31 @@ if [ -n "$iris_rotor_vel_p_gain" ]; then
   fi
 fi
 
-if [ "$fix_iris_imu_pose" -eq 1 ] || [ "$fix_iris_motor_map" -eq 1 ] || [ -n "$iris_yaw_gyro_scale" ] || [ -n "$iris_rotor_vel_p_gain" ]; then
+if [ -n "$iris_motor_time_constant" ]; then
+  if ! printf '%s\n' "$iris_motor_time_constant" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+    printf 'error: --iris-motor-time-constant must be numeric, got: %s\n' "$iris_motor_time_constant" >&2
+    exit 2
+  fi
+fi
+
+if [ -n "$iris_rotor_damping" ]; then
+  if ! printf '%s\n' "$iris_rotor_damping" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+    printf 'error: --iris-rotor-damping must be numeric, got: %s\n' "$iris_rotor_damping" >&2
+    exit 2
+  fi
+fi
+
+if [ -n "$gui_config" ]; then
+  if [ ! -f "$gui_config" ]; then
+    printf 'error: --gui-config file not found: %s\n' "$gui_config" >&2
+    exit 2
+  fi
+  if [ "$headless" -eq 1 ]; then
+    printf 'warning: --gui-config is ignored with --headless.\n' >&2
+  fi
+fi
+
+if [ "$fix_iris_imu_pose" -eq 1 ] || [ "$fix_iris_motor_map" -eq 1 ] || [ -n "$iris_yaw_gyro_scale" ] || [ -n "$iris_rotor_vel_p_gain" ] || [ "$iris_velocity_control" -eq 1 ] || [ -n "$iris_motor_time_constant" ] || [ -n "$iris_rotor_damping" ] || [ "$iris_forward_camera" -eq 1 ]; then
   src_model_dir="${AEROLOOP_GAZEBO}/models/betaloop_iris_with_standoffs"
   if [ ! -d "$src_model_dir" ]; then
     printf 'warning: Iris model not found, cannot apply temporary model fixes: %s\n' "$src_model_dir" >&2
@@ -255,6 +340,99 @@ if [ "$fix_iris_imu_pose" -eq 1 ] || [ "$fix_iris_motor_map" -eq 1 ] || [ -n "$i
       sed -i -E "s|<vel_p_gain>[[:space:]]*[^<]+[[:space:]]*</vel_p_gain>|<vel_p_gain>${iris_rotor_vel_p_gain}</vel_p_gain>|g" "$tmp_model_sdf"
       printf 'info: using temporary Iris model with rotor vel_p_gain=%s\n' "$iris_rotor_vel_p_gain" >&2
     fi
+    if [ "$iris_velocity_control" -eq 1 ]; then
+      sed -i -E 's|</rotor>|  <velocityControl>1</velocityControl>\n        </rotor>|g' "$tmp_model_sdf"
+      printf 'info: using temporary Iris model with rotor velocityControl=1\n' >&2
+    fi
+    if [ -n "$iris_motor_time_constant" ]; then
+      sed -i -E "s|</rotor>|  <motorTimeConstant>${iris_motor_time_constant}</motorTimeConstant>\n        </rotor>|g" "$tmp_model_sdf"
+      printf 'info: using temporary Iris model with rotor motorTimeConstant=%s\n' "$iris_motor_time_constant" >&2
+    fi
+    if [ -n "$iris_rotor_damping" ]; then
+      for rj in rotor_0_joint rotor_1_joint rotor_2_joint rotor_3_joint; do
+        sed -i -E "/<joint name='${rj}'/,/<\\/joint>/s|<damping>[^<]+</damping>|<damping>${iris_rotor_damping}</damping>|" "$tmp_model_sdf"
+      done
+      printf 'info: using temporary Iris model with rotor joint damping=%s\n' "$iris_rotor_damping" >&2
+    fi
+    if [ "$iris_forward_camera" -eq 1 ]; then
+      fpv_camera_snippet="${tmp_model_root}/fpv_camera_snippet.xml"
+      cat > "$fpv_camera_snippet" <<'EOF'
+    <link name='fpv_camera_link'>
+      <pose>0.14 0 0.04 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-06</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>1e-06</iyy>
+          <iyz>0</iyz>
+          <izz>1e-06</izz>
+        </inertia>
+      </inertial>
+      <visual name='fpv_camera_body'>
+        <geometry>
+          <box>
+            <size>0.02 0.022 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.15 0.15 0.15 1</diffuse>
+          <specular>0.1 0.1 0.1 1</specular>
+        </material>
+      </visual>
+      <visual name='fpv_camera_lens'>
+        <pose>0.013 0 0 0 1.5707963 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.006</radius>
+            <length>0.006</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.02 0.02 0.02 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+          <specular>0.4 0.4 0.4 1</specular>
+        </material>
+      </visual>
+      <sensor name='fpv_camera' type='camera'>
+        <pose>0 0 0 0 0 0</pose>
+        <topic>/kenet/fpv_camera</topic>
+        <update_rate>30</update_rate>
+        <camera>
+          <horizontal_fov>1.74</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>1000</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
+    </link>
+    <joint name='fpv_camera_joint' type='fixed'>
+      <parent>base_link</parent>
+      <child>fpv_camera_link</child>
+    </joint>
+EOF
+      awk -v snippet="$fpv_camera_snippet" '
+        index($0, "</model>") && !kenet_cam_done {
+          while ((getline line < snippet) > 0) print line
+          close(snippet)
+          kenet_cam_done = 1
+        }
+        { print }
+      ' "$tmp_model_sdf" > "${tmp_model_sdf}.kenetcam"
+      mv "${tmp_model_sdf}.kenetcam" "$tmp_model_sdf"
+      rm -f "$fpv_camera_snippet"
+      printf 'info: using temporary Iris model with forward FPV camera on /kenet/fpv_camera\n' >&2
+    fi
   fi
 fi
 
@@ -267,12 +445,27 @@ export SDF_PATH="${model_path_prefix}${SDF_PATH:+:${SDF_PATH}}"
 export GZ_SIM_RESOURCE_PATH="${AEROLOOP_GAZEBO}/worlds:${model_path_prefix}:${AEROLOOP_GAZEBO}${GZ_SIM_RESOURCE_PATH:+:${GZ_SIM_RESOURCE_PATH}}"
 export GZ_SIM_SYSTEM_PLUGIN_PATH="${AEROLOOP_GAZEBO}/plugins/build${GZ_SIM_SYSTEM_PLUGIN_PATH:+:${GZ_SIM_SYSTEM_PLUGIN_PATH}}"
 
+# GPU rendering: without this, GLVND picks the Mesa/DRI path, fails on the
+# NVIDIA card ("failed to create dri2 screen", driver (null)) and Ogre2 falls
+# back to CPU/software rendering — camera + GUI then crawl (measured RTF 0.46,
+# GPU idle). Forcing the NVIDIA EGL vendor puts rendering on the GPU (measured:
+# RTF 1.00, camera 30 fps, no dri2 warning). Only applied when the NVIDIA EGL
+# vendor file exists, so non-NVIDIA machines are unaffected, and it respects an
+# already-set value.
+nvidia_egl_json="/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+if [ -f "$nvidia_egl_json" ]; then
+  export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$nvidia_egl_json}"
+  export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+fi
+
 cmd=(gz sim -r -v "$verbosity")
 if [ "$headless" -eq 1 ]; then
   cmd+=( -s )
   if [ "$headless_rendering" -eq 1 ]; then
     cmd+=( --headless-rendering )
   fi
+elif [ -n "$gui_config" ]; then
+  cmd+=( --gui-config "$gui_config" )
 fi
 cmd+=( "$world_path" )
 
@@ -286,6 +479,7 @@ printf 'fix_iris_imu_pose=%s\n' "$fix_iris_imu_pose"
 printf 'fix_iris_motor_map=%s\n' "$fix_iris_motor_map"
 printf 'iris_yaw_gyro_scale=%s\n' "${iris_yaw_gyro_scale:-1.0}"
 printf 'iris_rotor_vel_p_gain=%s\n' "${iris_rotor_vel_p_gain:-model}"
+printf 'iris_forward_camera=%s\n' "$iris_forward_camera"
 printf 'command:'
 printf ' %q' "${cmd[@]}"
 printf '\n'

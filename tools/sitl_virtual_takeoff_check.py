@@ -23,7 +23,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from gazebo_motor_moment_probe import send_motor_speeds, terminate_process
 from sitl_debug_config import parse_debug_mode_value
 from sitl_log import make_log_path, resolve_log_dir
-from sitl_msp import MSP_ADVANCED_CONFIG, msp_request
+from sitl_msp import MSP_ADVANCED_CONFIG, MSP_STATUS_EX, msp_request, parse_status_ex
 
 
 FC_THROTTLE_INDEX = 3
@@ -32,6 +32,9 @@ FC_MODE_INDEX = 6
 SAFE_YAW_RC_RATE = 5
 SAFE_YAW_RATE = 30
 SAFE_YAW_RATE_LIMIT = 120
+SAFE_MANUAL_RC_RATE = 5
+SAFE_MANUAL_RATE = 30
+SAFE_MANUAL_RATE_LIMIT = 120
 
 
 def iter_jsonl(path: Path):
@@ -246,6 +249,7 @@ def start_logged_process(command: list[str], log_path: Path, cwd: Path, env: dic
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
     finally:
         log_handle.close()
@@ -270,9 +274,12 @@ def build_gazebo_command(args: argparse.Namespace) -> list[str]:
     command = [
         str(REPO_ROOT / "tools/run_gazebo_betaflight.sh"),
         "--world", args.world,
-        "--headless",
         "--max-step-size", args.max_step_size,
     ]
+    if not args.gazebo_gui:
+        command.append("--headless")
+    elif getattr(args, "gui_config", None):
+        command.extend(["--gui-config", args.gui_config])
     if args.fix_iris_imu_pose:
         command.append("--fix-iris-imu-pose")
     if args.fix_iris_motor_map:
@@ -281,7 +288,46 @@ def build_gazebo_command(args: argparse.Namespace) -> list[str]:
         command.extend(["--iris-yaw-gyro-scale", str(args.iris_yaw_gyro_scale)])
     if args.iris_rotor_vel_p_gain is not None:
         command.extend(["--iris-rotor-vel-p-gain", str(args.iris_rotor_vel_p_gain)])
+    if args.iris_velocity_control:
+        command.append("--iris-velocity-control")
+    if args.iris_motor_time_constant is not None:
+        command.extend(["--iris-motor-time-constant", str(args.iris_motor_time_constant)])
+    if args.iris_rotor_damping is not None:
+        command.extend(["--iris-rotor-damping", str(args.iris_rotor_damping)])
+    if args.iris_forward_camera:
+        command.append("--iris-forward-camera")
     return command
+
+
+def looptime_us_for_step(max_step_size: str) -> str:
+    """Map a Gazebo max_step_size (seconds, string) to whole microseconds.
+
+    The patched Betaflight SITL reads KENET_SITL_LOOPTIME_US (valid 100..10000)
+    and makes gyro/PID looptime match the lockstep FDM step instead of the
+    virtual gyro's claimed 8 kHz, so dT, I/D scaling, and filter inits are
+    truthful for the step actually being run.
+    """
+    step_seconds = float(max_step_size)
+    looptime_us = int(round(step_seconds * 1_000_000))
+    if not 100 <= looptime_us <= 10000:
+        raise RuntimeError(
+            "--sync-betaflight-looptime needs a step between 100us and 10000us, got %s" % max_step_size
+        )
+    return str(looptime_us)
+
+
+def lockstep_wait_env_value(lockstep_wait_us: int) -> str:
+    """Validate --lockstep-wait-us and return the KENET_SITL_LOCKSTEP_WAIT_US value.
+
+    The semaphore-patched Betaflight SITL blocks up to this many microseconds
+    for the next FDM packet inside lockMainPID instead of a pure trylock,
+    removing the scheduler/FDM phase race at fine steps.
+    """
+    if not 1 <= lockstep_wait_us <= 1_000_000:
+        raise RuntimeError(
+            "--lockstep-wait-us must be 1..1000000 microseconds, got %s" % lockstep_wait_us
+        )
+    return str(lockstep_wait_us)
 
 
 def betaflight_work_dir(args: argparse.Namespace, process_dir: Path) -> Path:
@@ -290,6 +336,51 @@ def betaflight_work_dir(args: argparse.Namespace, process_dir: Path) -> Path:
     work_dir = process_dir / "betaflight-cwd"
     work_dir.mkdir(parents=True, exist_ok=True)
     return work_dir
+
+
+def resolve_betaflight_config_file(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def build_betaflight_config_import_command(env: dict[str, str], config_file: Path) -> list[str]:
+    betaflight_bin = Path(env["BETAFLIGHT_ROOT"]) / "obj/main/betaflight_SITL.elf"
+    return [str(betaflight_bin), "--config", str(config_file)]
+
+
+def import_betaflight_config(
+    args: argparse.Namespace,
+    process_dir: Path,
+    env: dict[str, str],
+    work_dir: Path,
+) -> None:
+    if not args.betaflight_config_file:
+        return
+    config_file = resolve_betaflight_config_file(args.betaflight_config_file)
+    if not config_file.is_file():
+        raise RuntimeError("Betaflight config file not found: %s" % config_file)
+    log_path = process_dir / "betaflight-config-import.log"
+    command = build_betaflight_config_import_command(env, config_file)
+    with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(work_dir),
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=args.betaflight_config_import_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Betaflight config import timed out; see %s" % log_path) from exc
+    print("Betaflight config import: %s" % config_file)
+    print("Betaflight config import log: %s" % log_path)
+    if proc.returncode != 0:
+        raise RuntimeError("Betaflight config import failed with rc=%d; see %s" % (proc.returncode, log_path))
 
 
 def start_betaflight_process(
@@ -342,6 +433,38 @@ def wait_for_msp_ready(
             last_error = exc
             time.sleep(0.1)
     raise RuntimeError("Betaflight MSP not ready after %.1fs: %s" % (ready_timeout, last_error))
+
+
+def wait_for_arming_grace(
+    host: str,
+    port: int,
+    msp_timeout: float,
+    ready_timeout: float,
+) -> None:
+    """Block until Betaflight's boot-time arming grace (BOOTGRACE) clears.
+
+    If the ARM channel goes high while BOOTGRACE is still active, Betaflight
+    latches ARM_SWITCH and the fixed virtual RC script never re-toggles the
+    switch, so the run silently never arms (measured 2026-07-02 with the
+    looptime-sync build, whose boot takes longer). RXLOSS is expected here:
+    it only clears once RC packets start flowing.
+    """
+    deadline = time.monotonic() + ready_timeout
+    last_names: list[str] = []
+    while time.monotonic() < deadline:
+        try:
+            payload = msp_request(host, port, MSP_STATUS_EX, msp_timeout)
+            status = parse_status_ex(payload)
+            last_names = status.get("arming_disable_names") or []
+            if "BOOTGRACE" not in last_names:
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError(
+        "Betaflight arming grace did not clear after %.1fs (arming_disable=%s)"
+        % (ready_timeout, ",".join(last_names) or "unknown")
+    )
 
 
 def build_diagnostics_command(args: argparse.Namespace, diagnostics_log: Path) -> list[str]:
@@ -451,6 +574,12 @@ def build_rate_config_command(args: argparse.Namespace) -> list[str]:
         command.extend(["--yaw-rate", str(args.yaw_rate)])
     if args.yaw_rate_limit is not None:
         command.extend(["--yaw-rate-limit", str(args.yaw_rate_limit)])
+    if args.roll_rc_rate is not None:
+        command.extend(["--roll-rc-rate", str(args.roll_rc_rate)])
+    if args.roll_rate is not None:
+        command.extend(["--roll-rate", str(args.roll_rate)])
+    if args.roll_rate_limit is not None:
+        command.extend(["--roll-rate-limit", str(args.roll_rate_limit)])
     if args.pitch_rc_rate is not None:
         command.extend(["--pitch-rc-rate", str(args.pitch_rc_rate)])
     if args.pitch_rate is not None:
@@ -469,6 +598,22 @@ def apply_safe_yaw_authority(args: argparse.Namespace) -> argparse.Namespace:
         args.yaw_rate = SAFE_YAW_RATE
     if args.yaw_rate_limit is None:
         args.yaw_rate_limit = SAFE_YAW_RATE_LIMIT
+    return args
+
+
+def apply_safe_manual_authority(args: argparse.Namespace) -> argparse.Namespace:
+    if not getattr(args, "safe_manual_authority", False):
+        return args
+    for axis in ("roll", "pitch", "yaw"):
+        rc_key = "%s_rc_rate" % axis
+        rate_key = "%s_rate" % axis
+        limit_key = "%s_rate_limit" % axis
+        if getattr(args, rc_key) is None:
+            setattr(args, rc_key, SAFE_MANUAL_RC_RATE)
+        if getattr(args, rate_key) is None:
+            setattr(args, rate_key, SAFE_MANUAL_RATE)
+        if getattr(args, limit_key) is None:
+            setattr(args, limit_key, SAFE_MANUAL_RATE_LIMIT)
     return args
 
 
@@ -509,6 +654,7 @@ def build_motor_udp_command(args: argparse.Namespace, motor_udp_log: Path) -> li
 def main() -> int:
     args = parse_args()
     apply_safe_yaw_authority(args)
+    apply_safe_manual_authority(args)
     log_dir = resolve_log_dir(args.log_dir, REPO_ROOT)
     diagnostics_log = Path(args.diagnostics_log_file) if args.diagnostics_log_file else make_log_path(log_dir, "takeoff-diagnostics")
     motor_udp_log = (
@@ -526,6 +672,13 @@ def main() -> int:
     env.setdefault("FPV_ROOT", str(REPO_ROOT))
     env.setdefault("AEROLOOP_GAZEBO", str(REPO_ROOT / "../aeroloop_gazebo"))
     env.setdefault("BETAFLIGHT_ROOT", str(REPO_ROOT / "../betaflight"))
+    if args.sync_betaflight_looptime:
+        env["KENET_SITL_LOOPTIME_US"] = looptime_us_for_step(args.max_step_size)
+        print("Betaflight looptime sync: KENET_SITL_LOOPTIME_US=%s" % env["KENET_SITL_LOOPTIME_US"])
+    if args.lockstep_wait_us is not None:
+        env["KENET_SITL_LOCKSTEP_WAIT_US"] = lockstep_wait_env_value(args.lockstep_wait_us)
+        print("Betaflight lockstep bounded wait: KENET_SITL_LOCKSTEP_WAIT_US=%s"
+              % env["KENET_SITL_LOCKSTEP_WAIT_US"])
     betaflight_cwd = betaflight_work_dir(args, process_dir)
 
     gazebo_proc: subprocess.Popen[str] | None = None
@@ -542,6 +695,7 @@ def main() -> int:
                 raise RuntimeError("Gazebo exited early; see %s" % (process_dir / "gazebo.log"))
 
         if not args.no_start_betaflight:
+            import_betaflight_config(args, process_dir, env, betaflight_cwd)
             betaflight_proc = start_betaflight_process(args, process_dir, env, betaflight_cwd)
 
         if not args.no_start_betaflight:
@@ -602,6 +756,9 @@ def main() -> int:
             args.yaw_rc_rate is not None
             or args.yaw_rate is not None
             or args.yaw_rate_limit is not None
+            or args.roll_rc_rate is not None
+            or args.roll_rate is not None
+            or args.roll_rate_limit is not None
             or args.pitch_rc_rate is not None
             or args.pitch_rate is not None
             or args.pitch_rate_limit is not None
@@ -643,6 +800,14 @@ def main() -> int:
             time.sleep(0.2)
             if motor_udp_proc.poll() is not None:
                 raise RuntimeError("motor UDP probe exited early; stdout log %s" % (process_dir / "motor_udp.stdout.log"))
+
+        # Must run before the diagnostics poller starts: the SITL MSP TCP port
+        # accepts one client at a time, so a later poll would fight the
+        # diagnostics connection and time out. Applies to both RC drivers:
+        # external senders (kenet mixer) also use fixed scripts that latch
+        # ARM_SWITCH if the ARM channel rises during BOOTGRACE.
+        if not args.no_start_betaflight:
+            wait_for_arming_grace(args.msp_host, args.msp_port, args.msp_timeout, args.arming_grace_timeout)
 
         diagnostics_cmd = build_diagnostics_command(args, diagnostics_log)
         diagnostics_proc = start_logged_process(diagnostics_cmd, process_dir / "diagnostics.stdout.log", REPO_ROOT, env)
@@ -725,18 +890,53 @@ def parse_args() -> argparse.Namespace:
                         help="virtual sends the built-in RC takeoff script; external only observes RC already sent to Betaflight")
     parser.add_argument("--world", default="betaloop_iris_betaflight_demo_harmonic.sdf")
     parser.add_argument("--world-name", default="betaloop_demo")
+    # 0.0025 matches the bulk of the measured acceptance evidence (video/yaw
+    # gates). The coupled Gazebo iris plant is step-dependent per axis: yaw is
+    # stable at 0.0025 but unstable at 0.001 (P>=20 nudge / video yaw>=4),
+    # while the pitch nudge bracket is the opposite. Gates that need 0.001
+    # (pitch nudge profile) must pin it explicitly and record it as evidence.
     parser.add_argument("--max-step-size", default="0.0025")
+    parser.add_argument("--sync-betaflight-looptime", action="store_true",
+                        help="Export KENET_SITL_LOOPTIME_US=<step in us> so the patched Betaflight SITL "
+                             "initializes gyro/PID looptime and filters for the real lockstep step instead "
+                             "of the virtual gyro's claimed 8 kHz. Requires the looptime-sync patched build. "
+                             "Boundary evidence measured with and without this flag is not comparable.")
+    parser.add_argument("--lockstep-wait-us", type=int, default=None,
+                        help="Export KENET_SITL_LOCKSTEP_WAIT_US=<us> so the patched Betaflight SITL "
+                             "blocks up to this long for the next FDM packet inside lockMainPID instead "
+                             "of a pure trylock. Removes the scheduler/FDM phase race at fine steps "
+                             "(e.g. 4000 with --max-step-size 0.001). Requires the semaphore-patched build; "
+                             "unset keeps stock trylock behavior.")
+    parser.add_argument("--gazebo-gui", action="store_true",
+                        help="Start Gazebo with its GUI instead of the runner's default headless acceptance mode.")
+    parser.add_argument("--gui-config", default=None,
+                        help="Gazebo GUI config (e.g. tools/fpv_gui.config for the "
+                             "FPV camera panel); only used with --gazebo-gui.")
     parser.add_argument("--no-fix-iris-imu-pose", dest="fix_iris_imu_pose", action="store_false")
     parser.add_argument("--no-fix-iris-motor-map", dest="fix_iris_motor_map", action="store_false")
+    parser.add_argument("--iris-forward-camera", action="store_true",
+                        help="Inject a forward FPV camera into the temporary Iris model "
+                             "(topic /kenet/fpv_camera); matches the launch-fpv-sim.sh setup.")
     parser.set_defaults(fix_iris_imu_pose=True, fix_iris_motor_map=True)
     parser.add_argument("--iris-yaw-gyro-scale", type=float, default=None,
                         help="Temporary BetaflightPlugin yawGyroScale for Iris model diagnostics")
     parser.add_argument("--iris-rotor-vel-p-gain", type=float, default=None,
                         help="Temporary Iris rotor vel_p_gain for motor response diagnostics")
+    parser.add_argument("--iris-velocity-control", action="store_true",
+                        help="Drive Iris rotors with plugin velocity commands (fast ESC/motor servo) "
+                             "instead of the weak force PID; requires the velocity-control plugin build")
+    parser.add_argument("--iris-motor-time-constant", type=float, default=None,
+                        help="First-order rotor response time constant in seconds for --iris-velocity-control")
+    parser.add_argument("--iris-rotor-damping", type=float, default=None,
+                        help="Temporary Iris rotor joint damping (stock 0.004 makes differential yaw authority "
+                             "unrealistically hot; ~0.001 is closer to real-quad scale)")
     parser.add_argument("--no-start-gazebo", action="store_true")
     parser.add_argument("--no-start-betaflight", action="store_true")
     parser.add_argument("--betaflight-cwd", choices=["temp", "repo"], default="temp",
                         help="Working directory for Betaflight SITL; temp avoids persistent eeprom.bin state")
+    parser.add_argument("--betaflight-config-file", default=None,
+                        help="Optional Betaflight CLI config file to import into the runner-owned eeprom.bin before start")
+    parser.add_argument("--betaflight-config-import-timeout", type=float, default=20.0)
     parser.add_argument("--gazebo-startup-seconds", type=float, default=5.0)
     parser.add_argument("--betaflight-startup-seconds", type=float, default=1.0)
     parser.add_argument("--betaflight-restart-settle-seconds", type=float, default=2.0,
@@ -751,6 +951,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--msp-port", type=int, default=5761)
     parser.add_argument("--msp-timeout", type=float, default=1.0)
     parser.add_argument("--betaflight-ready-timeout", type=float, default=5.0)
+    parser.add_argument("--arming-grace-timeout", type=float, default=20.0,
+                        help="Seconds to wait for Betaflight's BOOTGRACE arming-disable flag to clear "
+                             "before the virtual RC script raises the ARM switch. Prevents the silent "
+                             "never-arms latch when boot (e.g. gyro calibration with --sync-betaflight-"
+                             "looptime) outlasts the RC script's fixed boot-low phase.")
     parser.add_argument("--yaw-motors-reversed", choices=["keep", "on", "off"], default="keep",
                         help="Optionally set Betaflight yaw_motors_reversed before the takeoff script")
     parser.add_argument("--zero-yaw-pid", action="store_true",
@@ -767,6 +972,12 @@ def parse_args() -> argparse.Namespace:
                         help="Set Betaflight yaw super-rate over MSP before the takeoff script")
     parser.add_argument("--yaw-rate-limit", type=parse_u16_value, default=None,
                         help="Set Betaflight yaw rate_limit over MSP before the takeoff script")
+    parser.add_argument("--roll-rc-rate", type=parse_byte_value, default=None,
+                        help="Set Betaflight roll_rc_rate over MSP before the takeoff script")
+    parser.add_argument("--roll-rate", type=parse_byte_value, default=None,
+                        help="Set Betaflight roll super-rate over MSP before the takeoff script")
+    parser.add_argument("--roll-rate-limit", type=parse_u16_value, default=None,
+                        help="Set Betaflight roll rate_limit over MSP before the takeoff script")
     parser.add_argument("--pitch-rc-rate", type=parse_byte_value, default=None,
                         help="Set Betaflight pitch_rc_rate over MSP before the takeoff script")
     parser.add_argument("--pitch-rate", type=parse_byte_value, default=None,
@@ -775,6 +986,8 @@ def parse_args() -> argparse.Namespace:
                         help="Set Betaflight pitch rate_limit over MSP before the takeoff script")
     parser.add_argument("--safe-yaw-authority", action="store_true",
                         help="Apply the measured Iris SITL safe yaw profile: yaw_rc_rate=5 yaw_rate=30 yaw_rate_limit=120")
+    parser.add_argument("--safe-manual-authority", action="store_true",
+                        help="Apply the measured Iris SITL safe roll/pitch/yaw profile: rc_rate=5 rate=30 rate_limit=120")
     parser.add_argument("--debug-mode", type=parse_debug_mode_value, default=None,
                         help=(
                             "Set Betaflight debug_mode before the takeoff script, "
@@ -838,6 +1051,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--betaflight-ready-timeout must be positive")
     if args.betaflight_restart_settle_seconds < 0:
         parser.error("--betaflight-restart-settle-seconds must be non-negative")
+    if args.betaflight_config_import_timeout <= 0:
+        parser.error("--betaflight-config-import-timeout must be positive")
     if args.iris_yaw_gyro_scale is not None and args.iris_yaw_gyro_scale <= 0:
         parser.error("--iris-yaw-gyro-scale must be positive")
     if args.iris_rotor_vel_p_gain is not None and args.iris_rotor_vel_p_gain <= 0:

@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import shutil
 import socket
 import struct
@@ -291,6 +292,7 @@ def start_process(command: list[str], log_path: Path, cwd: Path, env: dict[str, 
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
     finally:
         log_file.close()
@@ -299,11 +301,23 @@ def start_process(command: list[str], log_path: Path, cwd: Path, env: dict[str, 
 def terminate_process(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
-    proc.terminate()
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+
+    use_process_group = pgid != os.getpgrp()
+    if use_process_group:
+        os.killpg(pgid, signal.SIGTERM)
+    else:
+        proc.terminate()
     try:
         proc.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if use_process_group:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
         proc.wait(timeout=3)
 
 

@@ -91,6 +91,21 @@ def test_process_snapshot_reports_betaflight_cwd_and_eeprom_path(tmp_path):
     assert snapshot["betaflight"]["eeprom_path"] == str(tmp_path / "logs" / "dash-betaflight-cwd-3" / "eeprom.bin")
 
 
+def test_process_snapshot_marks_external_processes(monkeypatch, tmp_path):
+    manager = ProcessManager(args(log_dir=str(tmp_path / "logs"), msp_port=65530), tmp_path / "repo")
+    monkeypatch.setattr(
+        manager,
+        "_external_running_message",
+        lambda name: "Gazebo already appears active" if name == "gazebo" else None,
+    )
+
+    snapshot = manager.snapshot()
+
+    assert snapshot["gazebo"]["running"] is False
+    assert snapshot["gazebo"]["external_running"] is True
+    assert snapshot["gazebo"]["external_message"] == "Gazebo already appears active"
+
+
 def test_start_betaflight_uses_temp_working_directory(monkeypatch, tmp_path):
     calls = []
 
@@ -107,6 +122,7 @@ def test_start_betaflight_uses_temp_working_directory(monkeypatch, tmp_path):
     monkeypatch.setattr("sitl_dashboard.subprocess.Popen", FakePopen)
     manager = ProcessManager(args(log_dir=str(tmp_path / "logs")), tmp_path / "repo")
     manager.session_id = "dash"
+    monkeypatch.setattr(manager, "_external_running_message", lambda name: None)
 
     result = manager.start("betaflight")
 

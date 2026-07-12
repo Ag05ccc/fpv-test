@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import cv2
 import serial
 
-from .camera import CameraCapture
+from .camera import create_camera_capture
 from .tracker import ObjectTracker, TrackResult, TrackerType
 from .controller import FlightController, PIDGains
 from .msp import MSPConnection
@@ -118,8 +118,9 @@ class TrackingPipeline:
         self.cfg = config
 
         # Modules (created but not started yet)
-        self.camera = CameraCapture(config.camera_source, config.frame_width,
-                                    config.frame_height, config.camera_fps)
+        self.camera = create_camera_capture(
+            config.camera_source, config.frame_width,
+            config.frame_height, config.camera_fps)
         self.tracker = ObjectTracker(config.tracker_type)
         self.controller = FlightController(config)
         self.msp = MSPConnection(config.serial_port, config.baudrate)
@@ -458,6 +459,14 @@ class TrackingPipeline:
                 if w is not None:
                     self.controller.cfg.desired_target_width = float(w)
                     logger.info("GCS set desired_target_width=%.1f", w)
+            elif cmd.command == "set_pid":
+                axis = cmd.params.get("axis", "yaw")
+                pid = {k: cmd.params.get(k) for k in ("kp", "ki", "kd")}
+                controller = (self.controller.yaw_pid if axis == "yaw"
+                              else self.controller.forward_pid)
+                controller.set_gains(**pid)
+                logger.info("GCS set_pid axis=%s %s", axis,
+                            {k: v for k, v in pid.items() if v is not None})
             elif cmd.command == "ping":
                 logger.debug("GCS ping received")
 

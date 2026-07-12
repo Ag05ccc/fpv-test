@@ -31,7 +31,7 @@ from sitl_rc_bridge import CHANNEL_MAP, LinuxJoystick, apply_forced_mode_pwm, ma
 from sitl_log import JsonlLogger, make_log_path, resolve_log_dir
 from sitl_virtual_rc import make_virtual_channels
 
-from kenet.camera import CameraCapture
+from kenet.camera import create_camera_capture
 from kenet.controller import FlightController, PIDGains
 from kenet.pipeline import AI_ARMED, IDLE, TRACKING, PipelineConfig
 from kenet.state_machine import STATE_NAMES, state_from_aux
@@ -80,6 +80,11 @@ def synthetic_track_result(args):
     x = int(round(cx - w / 2.0))
     y = int(round(cy - h / 2.0))
     return TrackResult(found=True, bbox=(x, y, w, h), center=(cx, cy))
+
+
+def target_loss_forced(args) -> bool:
+    loss_after = getattr(args, "target_loss_after_seconds", None)
+    return loss_after is not None and args.synthetic_elapsed_seconds >= loss_after
 
 
 class KenetSitlMixer:
@@ -142,7 +147,7 @@ class KenetSitlMixer:
         if self.args.synthetic_target:
             self.controller.set_frame_center(self.args.frame_width, self.args.frame_height)
         elif not self.args.no_vision:
-            self.camera = CameraCapture(
+            self.camera = create_camera_capture(
                 self.cfg.camera_source,
                 self.cfg.frame_width,
                 self.cfg.frame_height,
@@ -326,6 +331,7 @@ class KenetSitlMixer:
         return 1000, 1000
 
     def _update_vision_state(self, frame, pilot_channels):
+        self.args.synthetic_elapsed_seconds = self._virtual_elapsed()
         aux_value = pilot_channels[self.args.aux_ch]
         self.state = state_from_aux(
             aux_value,
@@ -381,7 +387,10 @@ class KenetSitlMixer:
                 if self.tracker is None:
                     self.last_result = TrackResult()
                     return self.last_result
-            result = self.tracker.update(frame)
+            if target_loss_forced(self.args):
+                result = TrackResult(found=False)
+            else:
+                result = self.tracker.update(frame)
             self.last_result = result
             if result.found:
                 self.lost_count = 0
@@ -405,7 +414,6 @@ class KenetSitlMixer:
         return self.last_result
 
     def _synthetic_track_result(self):
-        self.args.synthetic_elapsed_seconds = self._virtual_elapsed()
         return synthetic_track_result(self.args)
 
     def _init_tracking(self, frame):
@@ -492,6 +500,7 @@ class KenetSitlMixer:
                     "limit": self.args.forward_limit,
                 },
             },
+            "target_loss_after_seconds": self.args.target_loss_after_seconds,
         }, flush_every=self.args.flight_log_flush_every,
             flush_interval=self.args.flight_log_flush_seconds,
             max_bytes=max_bytes)
@@ -623,6 +632,8 @@ def parse_args():
                         help="Keep the synthetic target centered for this long before applying the configured offset")
     parser.add_argument("--synthetic-target-loss-after-seconds", type=float, default=None,
                         help="After this elapsed time, make the synthetic target disappear")
+    parser.add_argument("--target-loss-after-seconds", type=float, default=None,
+                        help="After this virtual-pilot elapsed time, force camera/video tracking to target-lost")
 
     parser.add_argument("--frame-width", type=int, default=640)
     parser.add_argument("--frame-height", type=int, default=480)
@@ -731,6 +742,8 @@ def parse_args():
         parser.error("--synthetic-target-delay-seconds must be non-negative")
     if args.synthetic_target_loss_after_seconds is not None and args.synthetic_target_loss_after_seconds < 0:
         parser.error("--synthetic-target-loss-after-seconds must be non-negative")
+    if args.target_loss_after_seconds is not None and args.target_loss_after_seconds < 0:
+        parser.error("--target-loss-after-seconds must be non-negative")
     return args
 
 

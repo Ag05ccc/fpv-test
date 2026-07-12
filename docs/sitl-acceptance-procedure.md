@@ -1,16 +1,24 @@
 # SITL Acceptance Procedure
 
-Bu dokuman fiziksel RC izole durumdayken Kenet/Gazebo/Betaflight SITL
-kapilarini tekrar kosmak icin kisa kontrol listesidir. README komutlari aktif
-`fpv_env` varsayar; temiz shell icin `fpv_env/bin/python ...` kullan.
+Bu dokuman Kenet/Gazebo/Betaflight SITL kapilarini fiziksel kumanda olmadan
+(sanal RC ile) tekrar kosmak icin kisa kontrol listesidir. README komutlari
+aktif `fpv_env` varsayar; temiz shell icin `fpv_env/bin/python ...` kullan.
+En kisa sirali runbook icin `docs/sitl-quickstart.md`, olculebilir "SITL
+hazir" hukmu, kosu gecerliligi ve tekrar kriterleri icin
+`docs/sitl-flight-readiness-criteria.md` dosyasini kullan.
 
 ## Varsayimlar
 
 - `BETAFLIGHT_ROOT` Betaflight checkout'una isaret eder.
 - `AEROLOOP_GAZEBO` Aeroloop Gazebo checkout'una isaret eder.
-- Fiziksel Tango/joystick yolu aksi soylenmedikce izoledir.
+- Fiziksel Tango/joystick yolu kalici olarak opsiyoneldir: butun gelistirme ve
+  kabul kapilari sanal RC ile kosulur; fiziksel RC yalniz kullanici kendi
+  inisiyatifiyle dener ve hicbir kapinin on sarti degildir.
 - Betaflight temp cwd kullanilir; repo-root `eeprom.bin` sadece
   `--betaflight-cwd repo` ile opt-in.
+- Bir kosu ancak GECERLI ise PASS/FAIL kaniti sayilir: `armed_angle_samples >
+  0` ve ilk diagnostik ornek temiz (roll/pitch ~0, disarmed, motorlar 1000).
+  Hic arm olmayan veya kirli baslayan kosular INVALID olarak etiketlenir.
 
 ## Hizli No-Hardware Gate
 
@@ -162,6 +170,13 @@ Guncel kanit:
   `logs/sitl/20260630-064350-takeoff-virtual-rc.jsonl`.
 - Ozet: altitude gain `31.402 m`, max roll/pitch `0.000/0.000`, raw spread
   `0.618`, raw axis `25/100/200/400us` esikleri tetiklenmedi.
+- 2026-07-02 safe-yaw regression `5/5 PASS` (step 0.001 pinli, hold 40):
+  `logs/sitl/20260702-0131xx..0136xx-takeoff-*`. Ozet: spread `0.000`,
+  roll/pitch `0.000/0.000`, RTF 0.998-1.006, kadans ~999 Hz.
+- 2026-07-02 P23/yaw1504 + safe-yaw @0.001 PASS (spread `0.682`). Ayni gun
+  yaw1504 nudge P-sweep @0.001: P19 `2/2 PASS`, P20 FAIL, P21 `2/2 FAIL`,
+  P22 `5/5 FAIL` deterministik. Yaw nudge braketi adima baglidir; step
+  kanit satirina yazilir.
 
 ## Real Video Target-Found Gate
 
@@ -233,6 +248,36 @@ Guncel kanit:
   mixer `source=kenet 200`, `pilot-target-lost 19`, `AI-ARMED 650`,
   max final-pilot delta `0`.
 
+Real video target-loss gate:
+
+```bash
+fpv_env/bin/python tools/sitl_video_tracking_check.py \
+  --camera test-2.mp4 \
+  --run-id video-target-loss-p23-delay18 \
+  --virtual-hold-seconds 80 \
+  --yaw-limit 0 \
+  --forward-limit 0 \
+  --max-abs-delta 0 \
+  --yaw-pid 23,0,0 \
+  --pitch-pid 23,0,0 \
+  --kenet-delay-seconds 18 \
+  --target-loss-after-seconds 24 \
+  --min-target-lost-samples 1 \
+  --min-ai-armed-samples 1
+```
+
+- Bu gate gerçek video/tracker yolunu kullanır; `--target-loss-after-seconds`
+  yalnız target-loss geçişini deterministik tetikler.
+- Kabul: önce `target_found/source=kenet`, sonra `source=pilot-target-lost`,
+  sonra `AI-ARMED`; tüm pencerede final-pilot delta `0`.
+- 2026-06-30 real-video target-loss final gate PASS:
+  `logs/sitl/20260630-video-target-loss-p23-delay18-final-diagnostics.jsonl`,
+  `logs/sitl/20260630-video-target-loss-p23-delay18-final-mixer.jsonl`,
+  `logs/sitl/20260630-video-target-loss-p23-delay18-final-motor-udp.jsonl`.
+- Ozet: altitude gain `30.175 m`, max roll/pitch `0/0`, motor/raw spread `0`,
+  mixer `target_found/source=kenet 31`, `pilot-target-lost 40`,
+  `AI-ARMED 265`, max pitch/yaw delta `0/0`.
+
 Nonzero yaw command-response gate:
 
 ```bash
@@ -243,6 +288,9 @@ fpv_env/bin/python tools/sitl_video_tracking_check.py \
   --yaw-limit 4 \
   --forward-limit 0 \
   --max-abs-delta 4 \
+  --min-abs-yaw-delta 4 \
+  --max-abs-yaw-delta 4 \
+  --max-abs-pitch-delta 0 \
   --yaw-pid 23,0,0 \
   --kenet-delay-seconds 18
 ```
@@ -289,6 +337,22 @@ Guncel nonzero kanit:
   video yaw command-response braketinde güncel sınır yaw5 PASS / yaw6 FAIL.
 
 Pitch-only command-response gate:
+
+```bash
+fpv_env/bin/python tools/sitl_video_tracking_check.py \
+  --camera test-2.mp4 \
+  --run-id video-target-found-pitch5-p23-delay18-pitchpid23 \
+  --virtual-hold-seconds 40 \
+  --yaw-limit 0 \
+  --forward-limit 5 \
+  --max-abs-delta 5 \
+  --min-abs-pitch-delta 5 \
+  --max-abs-pitch-delta 5 \
+  --max-abs-yaw-delta 0 \
+  --yaw-pid 23,0,0 \
+  --pitch-pid 23,0,0 \
+  --kenet-delay-seconds 18
+```
 
 - 2026-06-30 `test-2.mp4` pitch2/P23/delay18 default-pitch-PID gate FAIL:
   `logs/sitl/20260630-video-target-found-pitch2-p23-delay18-diagnostics.jsonl`,
@@ -346,6 +410,10 @@ fpv_env/bin/python tools/sitl_video_tracking_check.py \
   --yaw-limit 3 \
   --forward-limit 3 \
   --max-abs-delta 3 \
+  --min-abs-yaw-delta 3 \
+  --min-abs-pitch-delta 3 \
+  --max-abs-yaw-delta 3 \
+  --max-abs-pitch-delta 3 \
   --yaw-pid 23,0,0 \
   --pitch-pid 23,0,0 \
   --kenet-delay-seconds 18
@@ -376,9 +444,31 @@ Guncel combined kanit:
   delta `4/4`. Bu nedenle combined command-response braketinde guncel sinir
   yaw3+pitch3 PASS / yaw4+pitch4 FAIL.
 
-## External / Physical RC Gate
+2026-07-02 dogrulama turu (tamami sanal RC, step 0.0025 pinli; video checker
+artik `--max-step-size` bayragini destekliyor):
 
-Bu gate yalniz `/dev/input/js*` gorundugunde kosulacak.
+- yaw4/P23/delay18 @0.0025 PASS: altitude gain `31.505 m`, max roll/pitch
+  `0.500/5.500`, spread `0.000`
+  (`logs/sitl/20260702-video-yaw4-p23-delay18-step0025-*`).
+- pitch5/P23/delay18/pitchpid23 @0.0025 PASS: altitude gain `31.654 m`, max
+  roll/pitch `0.200/0.200`, spread `0.000`
+  (`logs/sitl/20260702-video-pitch5-p23-delay18-pitchpid23-step0025-*`).
+- combined yaw3+pitch3 @0.0025 PASS: altitude gain `31.586 m`, max roll/pitch
+  `0.000/2.100`, spread `0.000`
+  (`logs/sitl/20260702-video-yaw3-pitch3-p23-delay18-pitchpid23-step0025-*`).
+- real-video target-loss @0.0025 PASS: kenet 34 -> pilot-target-lost 36 ->
+  AI-ARMED 264, delta `0/0`, spread `0.000`
+  (`logs/sitl/20260702-video-target-loss-p23-delay18-step0025-*`).
+- Step bagimliligi: ayni yaw4 profili step `0.001`'de FAIL (roll 180, MSP
+  spread 945, `logs/sitl/20260702-video-yaw4-p23-delay18-*`); yaw2 @0.001
+  PASS. Video braketleri step ile birlikte okunur; default 0.0025'tir.
+
+## External / Physical RC Gate (Opsiyonel, Kullanici Inisiyatifi)
+
+Bu gate opsiyoneldir: SITL kabulu icin gerekli degildir ve kullanicidan
+kosmasi istenmez. Kullanici kendi isterse, yalniz `/dev/input/js*`
+gorundugunde kosulur. Cihazin gorunmesi tek basina canli RC sender icin
+yeterli degildir; once hareketli no-send preflight PASS olmalidir.
 
 Once switch ayrimini RC gondermeden kontrol et:
 
@@ -438,7 +528,11 @@ Her kosuda su alanlari not et:
 
 - Komut ve tarih.
 - Log path'leri.
-- PASS/FAIL.
+- Verdict: PASS / FAIL / INVALID (INVALID: armed=0 veya kirli ilk ornek;
+  brakete kanit yazilmaz).
 - Max roll/pitch, altitude gain, max raw motor spread.
-- Ilk raw axis threshold zamani.
+- Ilk raw axis threshold zamani (FAIL ise nudge'a gore split zamani).
+- Simulasyon sagligi: RTF min/max (0.99-1.01 bandi) ve motor UDP kadansi
+  (step'e uygun Hz); detay esikler `docs/sitl-flight-readiness-criteria.md`.
 - State gecisleri: `IDLE`, `AI-ARMED`, `TRACKING`, target lost/drop.
+- Sinir noktasi olcumlerinde tekrar sayisi (kabul profili icin 5/5 kurali).

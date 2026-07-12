@@ -37,6 +37,15 @@ class PIDController:
         self._prev_error = 0.0
         self._prev_time = None
 
+    def set_gains(self, kp=None, ki=None, kd=None):
+        """Update PID gains at runtime (e.g. from a GCS set_pid command)."""
+        if kp is not None:
+            self.gains.kp = float(kp)
+        if ki is not None:
+            self.gains.ki = float(ki)
+        if kd is not None:
+            self.gains.kd = float(kd)
+
     def update(self, error, t=None):
         now = t if t is not None else time.monotonic()
         if self._prev_time is None:

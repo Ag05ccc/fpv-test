@@ -44,6 +44,12 @@ def build_checker_command(args: argparse.Namespace, diagnostics_log: Path, motor
         "--min-altitude-gain", str(args.min_altitude_gain),
         "--diagnostics-log-file", str(diagnostics_log),
     ]
+    if args.max_step_size is not None:
+        command.extend(["--max-step-size", args.max_step_size])
+    if args.sync_betaflight_looptime:
+        command.append("--sync-betaflight-looptime")
+    if args.iris_rotor_damping is not None:
+        command.extend(["--iris-rotor-damping", str(args.iris_rotor_damping)])
     if args.safe_yaw_authority:
         command.append("--safe-yaw-authority")
     if args.yaw_pid is not None:
@@ -56,6 +62,14 @@ def build_checker_command(args: argparse.Namespace, diagnostics_log: Path, motor
         command.extend(["--pitch-rate", str(args.pitch_rate)])
     if args.pitch_rate_limit is not None:
         command.extend(["--pitch-rate-limit", str(args.pitch_rate_limit)])
+    if args.yaw_rc_rate is not None:
+        command.extend(["--yaw-rc-rate", str(args.yaw_rc_rate)])
+    if args.yaw_rate is not None:
+        command.extend(["--yaw-rate", str(args.yaw_rate)])
+    if args.yaw_rate_limit is not None:
+        command.extend(["--yaw-rate-limit", str(args.yaw_rate_limit)])
+    if args.betaflight_config_file is not None:
+        command.extend(["--betaflight-config-file", args.betaflight_config_file])
     if args.capture_motor_udp:
         command.append("--capture-motor-udp")
         if motor_udp_log is not None:
@@ -64,6 +78,14 @@ def build_checker_command(args: argparse.Namespace, diagnostics_log: Path, motor
         command.append("--no-fix-iris-imu-pose")
     if args.no_fix_iris_motor_map:
         command.append("--no-fix-iris-motor-map")
+    if args.world is not None:
+        command.extend(["--world", args.world])
+    if args.iris_forward_camera:
+        command.append("--iris-forward-camera")
+    if getattr(args, "gazebo_gui", False):
+        command.append("--gazebo-gui")
+        if getattr(args, "gui_config", None):
+            command.extend(["--gui-config", args.gui_config])
     return command
 
 
@@ -80,7 +102,7 @@ def mixer_duration(args: argparse.Namespace) -> float:
 
 
 def build_mixer_command(args: argparse.Namespace, mixer_log: Path) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(SCRIPT_DIR / "kenet_sitl_mixer.py"),
         "--pilot-source", "virtual",
@@ -112,6 +134,9 @@ def build_mixer_command(args: argparse.Namespace, mixer_log: Path) -> list[str]:
         "--print-hz", str(args.mixer_print_hz),
         "--flight-log", str(mixer_log),
     ]
+    if args.target_loss_after_seconds is not None:
+        command.extend(["--target-loss-after-seconds", str(args.target_loss_after_seconds)])
+    return command
 
 
 def communicate_or_terminate(proc: subprocess.Popen[str], timeout: float, label: str) -> tuple[int, str]:
@@ -129,7 +154,10 @@ def summarize_mixer_log(path: Path) -> dict[str, Any]:
         "samples": 0,
         "tracking_samples": 0,
         "target_found_samples": 0,
+        "target_lost_samples": 0,
         "kenet_source_samples": 0,
+        "target_lost_source_samples": 0,
+        "ai_armed_samples": 0,
         "max_abs_delta": 0,
         "max_abs_pitch_delta": 0,
         "max_abs_yaw_delta": 0,
@@ -140,12 +168,21 @@ def summarize_mixer_log(path: Path) -> dict[str, Any]:
         if record.get("event") != "kenet_mixer_sample":
             continue
         summary["samples"] += 1
-        if record.get("state") == "TRACKING":
+        state = record.get("state")
+        source = record.get("source")
+        target_found = bool(record.get("target_found"))
+        if state == "TRACKING":
             summary["tracking_samples"] += 1
-        if record.get("target_found"):
+        if state == "AI-ARMED":
+            summary["ai_armed_samples"] += 1
+        if target_found:
             summary["target_found_samples"] += 1
-        if record.get("source") == "kenet":
+        else:
+            summary["target_lost_samples"] += 1
+        if source == "kenet":
             summary["kenet_source_samples"] += 1
+        if source == "pilot-target-lost":
+            summary["target_lost_source_samples"] += 1
         delta = ((record.get("first8") or {}).get("delta") or [])[:8]
         if delta:
             summary["max_abs_delta"] = max(summary["max_abs_delta"], max(abs(int(value)) for value in delta))
@@ -173,10 +210,26 @@ def validate_mixer_summary(summary: dict[str, Any], args: argparse.Namespace) ->
         failures.append("target_found sample sayisi yetersiz: %s" % summary["target_found_samples"])
     if summary["kenet_source_samples"] < args.min_kenet_source_samples:
         failures.append("source=kenet sample sayisi yetersiz: %s" % summary["kenet_source_samples"])
+    if summary["target_lost_source_samples"] < args.min_target_lost_samples:
+        failures.append("source=pilot-target-lost sample sayisi yetersiz: %s" % summary["target_lost_source_samples"])
+    if summary["ai_armed_samples"] < args.min_ai_armed_samples:
+        failures.append("AI-ARMED sample sayisi yetersiz: %s" % summary["ai_armed_samples"])
     if summary["tracker_errors"]:
         failures.append("tracker error: %s" % "; ".join(summary["tracker_errors"]))
     if args.max_abs_delta is not None and summary["max_abs_delta"] > args.max_abs_delta:
         failures.append("mixer delta limiti asildi: %s > %s" % (summary["max_abs_delta"], args.max_abs_delta))
+    if args.min_abs_pitch_delta is not None and summary["max_abs_pitch_delta"] < args.min_abs_pitch_delta:
+        failures.append(
+            "pitch delta yetersiz: %s < %s" % (summary["max_abs_pitch_delta"], args.min_abs_pitch_delta)
+        )
+    if args.min_abs_yaw_delta is not None and summary["max_abs_yaw_delta"] < args.min_abs_yaw_delta:
+        failures.append("yaw delta yetersiz: %s < %s" % (summary["max_abs_yaw_delta"], args.min_abs_yaw_delta))
+    if args.max_abs_pitch_delta is not None and summary["max_abs_pitch_delta"] > args.max_abs_pitch_delta:
+        failures.append(
+            "pitch delta limiti asildi: %s > %s" % (summary["max_abs_pitch_delta"], args.max_abs_pitch_delta)
+        )
+    if args.max_abs_yaw_delta is not None and summary["max_abs_yaw_delta"] > args.max_abs_yaw_delta:
+        failures.append("yaw delta limiti asildi: %s > %s" % (summary["max_abs_yaw_delta"], args.max_abs_yaw_delta))
     return failures
 
 
@@ -264,6 +317,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mixer-start-delay", type=float, default=8.0)
     parser.add_argument("--mixer-timeout", type=float, default=90.0)
     parser.add_argument("--mixer-print-hz", type=float, default=1.0)
+    parser.add_argument("--target-loss-after-seconds", type=float, default=None,
+                        help="Force real camera/video target-loss after this virtual-pilot elapsed time")
 
     parser.add_argument("--track-size", type=int, default=100)
     parser.add_argument("--desired-target-width", type=float, default=120.0)
@@ -285,6 +340,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checker-timeout", type=float, default=300.0)
     parser.add_argument("--max-abs-attitude", type=float, default=35.0)
     parser.add_argument("--min-altitude-gain", type=float, default=1.0)
+    parser.add_argument("--max-step-size", default=None,
+                        help="Optional Gazebo physics step passed to the external checker, e.g. 0.001 or 0.0025. "
+                             "Default keeps the external checker's own default; command-response brackets are "
+                             "step-dependent, so record the effective step with the evidence.")
+    parser.add_argument("--sync-betaflight-looptime", action="store_true",
+                        help="Pass --sync-betaflight-looptime to the external checker (requires the "
+                             "looptime-sync patched Betaflight SITL build).")
+    parser.add_argument("--iris-rotor-damping", type=float, default=None,
+                        help="Pass --iris-rotor-damping to the external checker (temporary Iris rotor "
+                             "joint damping override).")
     parser.add_argument("--safe-yaw-authority", action="store_true", default=True)
     parser.add_argument("--no-safe-yaw-authority", action="store_false", dest="safe_yaw_authority")
     parser.add_argument("--yaw-pid", default=None,
@@ -297,16 +362,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Optional Betaflight pitch super-rate passed to the external checker")
     parser.add_argument("--pitch-rate-limit", type=int, default=None,
                         help="Optional Betaflight pitch rate_limit passed to the external checker")
+    parser.add_argument("--yaw-rc-rate", type=int, default=None,
+                        help="Optional Betaflight yaw_rc_rate passed to the external checker "
+                             "(overrides the --safe-yaw-authority value for that field)")
+    parser.add_argument("--yaw-rate", type=int, default=None,
+                        help="Optional Betaflight yaw super-rate passed to the external checker")
+    parser.add_argument("--yaw-rate-limit", type=int, default=None,
+                        help="Optional Betaflight yaw rate_limit passed to the external checker")
+    parser.add_argument("--betaflight-config-file", default=None,
+                        help="Optional Betaflight CLI config file imported into the SITL eeprom "
+                             "before the run (passed to the external checker); rate/PID flags "
+                             "still apply over MSP afterwards")
     parser.add_argument("--capture-motor-udp", action="store_true", default=True)
     parser.add_argument("--no-capture-motor-udp", action="store_false", dest="capture_motor_udp")
     parser.add_argument("--no-fix-iris-imu-pose", action="store_true")
     parser.add_argument("--no-fix-iris-motor-map", action="store_true")
+    parser.add_argument("--world", default=None,
+                        help="World name/path forwarded to the external checker "
+                             "(e.g. betaloop_iris_betaflight_demo_populated.sdf)")
+    parser.add_argument("--iris-forward-camera", action="store_true",
+                        help="Inject the forward FPV camera into the Iris and let "
+                             "the mixer consume it live via --camera gz:/kenet/fpv_camera")
+    parser.add_argument("--gazebo-gui", action="store_true",
+                        help="Watch the run in the Gazebo GUI instead of headless")
+    parser.add_argument("--gui-config", default=None,
+                        help="Gazebo GUI config (e.g. tools/fpv_gui.config)")
 
     parser.add_argument("--min-tracking-samples", type=int, default=5)
     parser.add_argument("--min-target-found-samples", type=int, default=5)
     parser.add_argument("--min-kenet-source-samples", type=int, default=5)
+    parser.add_argument("--min-target-lost-samples", type=int, default=0)
+    parser.add_argument("--min-ai-armed-samples", type=int, default=0)
     parser.add_argument("--max-abs-delta", type=int, default=0,
                         help="Default 0 proves real video target-found without commanding pitch/yaw.")
+    parser.add_argument("--min-abs-pitch-delta", type=int, default=None,
+                        help="Require the mixer to command at least this pitch delta")
+    parser.add_argument("--min-abs-yaw-delta", type=int, default=None,
+                        help="Require the mixer to command at least this yaw delta")
+    parser.add_argument("--max-abs-pitch-delta", type=int, default=None,
+                        help="Optional pitch-axis command ceiling")
+    parser.add_argument("--max-abs-yaw-delta", type=int, default=None,
+                        help="Optional yaw-axis command ceiling")
 
     args = parser.parse_args(argv)
     if not 1000 <= args.throttle <= 2000:
@@ -328,6 +424,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         if getattr(args, name) < 0:
             parser.error("--%s must be non-negative" % name.replace("_", "-"))
+    if args.target_loss_after_seconds is not None and args.target_loss_after_seconds < 0:
+        parser.error("--target-loss-after-seconds must be non-negative")
     for name in ("diagnostic_samples", "track_size"):
         if getattr(args, name) <= 0:
             parser.error("--%s must be positive" % name.replace("_", "-"))
@@ -337,17 +435,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for name in ("yaw_ki", "yaw_kd", "forward_ki", "forward_kd", "yaw_limit", "forward_limit"):
         if getattr(args, name) < 0:
             parser.error("--%s must be non-negative" % name.replace("_", "-"))
-    for name in ("min_tracking_samples", "min_target_found_samples", "min_kenet_source_samples"):
+    for name in (
+        "min_tracking_samples",
+        "min_target_found_samples",
+        "min_kenet_source_samples",
+        "min_target_lost_samples",
+        "min_ai_armed_samples",
+    ):
         if getattr(args, name) < 0:
             parser.error("--%s must be non-negative" % name.replace("_", "-"))
     if args.max_abs_delta is not None and args.max_abs_delta < 0:
         parser.error("--max-abs-delta must be non-negative")
-    for name in ("pitch_rc_rate", "pitch_rate"):
+    for name in ("min_abs_pitch_delta", "min_abs_yaw_delta", "max_abs_pitch_delta", "max_abs_yaw_delta"):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            parser.error("--%s must be non-negative" % name.replace("_", "-"))
+    for name in ("pitch_rc_rate", "pitch_rate", "yaw_rc_rate", "yaw_rate"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 255:
             parser.error("--%s must be 0..255" % name.replace("_", "-"))
-    if args.pitch_rate_limit is not None and not 0 <= args.pitch_rate_limit <= 65535:
-        parser.error("--pitch-rate-limit must be 0..65535")
+    for name in ("pitch_rate_limit", "yaw_rate_limit"):
+        value = getattr(args, name)
+        if value is not None and not 0 <= value <= 65535:
+            parser.error("--%s must be 0..65535" % name.replace("_", "-"))
     return args
 
 

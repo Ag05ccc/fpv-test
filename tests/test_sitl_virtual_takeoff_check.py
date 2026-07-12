@@ -9,14 +9,19 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from sitl_virtual_takeoff_check import (  # noqa: E402
+    SAFE_MANUAL_RATE,
+    SAFE_MANUAL_RATE_LIMIT,
+    SAFE_MANUAL_RC_RATE,
     SAFE_YAW_RATE,
     SAFE_YAW_RATE_LIMIT,
     SAFE_YAW_RC_RATE,
     analyze_diagnostics,
     analyze_motor_udp_log,
+    apply_safe_manual_authority,
     apply_safe_yaw_authority,
     betaflight_work_dir,
     bootstrap_gazebo_state,
+    build_betaflight_config_import_command,
     build_debug_config_command,
     build_diagnostics_command,
     build_gazebo_command,
@@ -27,7 +32,10 @@ from sitl_virtual_takeoff_check import (  # noqa: E402
     build_virtual_rc_command,
     estimate_virtual_rc_timeout,
     estimate_motor_udp_duration,
+    lockstep_wait_env_value,
+    looptime_us_for_step,
     parse_pid_triplet,
+    resolve_betaflight_config_file,
     wait_for_msp_ready,
 )
 
@@ -69,22 +77,33 @@ def args(**overrides):
         "yaw_rc_rate": None,
         "yaw_rate": None,
         "yaw_rate_limit": None,
+        "roll_rc_rate": None,
+        "roll_rate": None,
+        "roll_rate_limit": None,
         "pitch_rc_rate": None,
         "pitch_rate": None,
         "pitch_rate_limit": None,
         "safe_yaw_authority": False,
+        "safe_manual_authority": False,
         "debug_mode": None,
         "no_debug_restart": False,
         "motor_udp_duration": None,
         "pre_takeoff_seconds": 1.0,
         "betaflight_cwd": "temp",
+        "betaflight_config_file": None,
+        "betaflight_config_import_timeout": 20.0,
         "betaflight_ready_timeout": 5.0,
         "fix_iris_imu_pose": True,
         "fix_iris_motor_map": True,
         "iris_yaw_gyro_scale": None,
         "iris_rotor_vel_p_gain": None,
+        "iris_velocity_control": False,
+        "iris_motor_time_constant": None,
+        "iris_rotor_damping": None,
+        "iris_forward_camera": False,
         "world": "betaloop_iris_betaflight_demo_harmonic.sdf",
-        "max_step_size": "0.0025",
+        "max_step_size": "0.001",
+        "gazebo_gui": False,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -215,6 +234,44 @@ def test_gazebo_command_can_set_temporary_yaw_gyro_scale():
     assert command[command.index("--iris-yaw-gyro-scale") + 1] == "0.5"
 
 
+def test_gazebo_command_can_enable_rotor_velocity_control():
+    command = build_gazebo_command(args(iris_velocity_control=True, iris_motor_time_constant=0.02))
+
+    assert "--iris-velocity-control" in command
+    assert command[command.index("--iris-motor-time-constant") + 1] == "0.02"
+
+
+def test_gazebo_command_can_start_gui():
+    command = build_gazebo_command(args(gazebo_gui=True))
+
+    assert "--headless" not in command
+
+
+def test_gazebo_command_defaults_to_headless():
+    command = build_gazebo_command(args())
+
+    assert "--headless" in command
+
+
+def test_gazebo_command_omits_velocity_control_by_default():
+    command = build_gazebo_command(args())
+
+    assert "--iris-velocity-control" not in command
+    assert "--iris-motor-time-constant" not in command
+
+
+def test_gazebo_command_can_enable_forward_camera():
+    command = build_gazebo_command(args(iris_forward_camera=True))
+
+    assert "--iris-forward-camera" in command
+
+
+def test_gazebo_command_omits_forward_camera_by_default():
+    command = build_gazebo_command(args())
+
+    assert "--iris-forward-camera" not in command
+
+
 def test_gazebo_command_can_set_temporary_rotor_velocity_p_gain():
     command = build_gazebo_command(args(iris_rotor_vel_p_gain=0.01))
 
@@ -314,6 +371,14 @@ def test_rate_config_command_can_set_pitch_authority():
     assert command[command.index("--pitch-rate-limit") + 1] == "120"
 
 
+def test_rate_config_command_can_set_roll_authority():
+    command = build_rate_config_command(args(msp_timeout=2.5, roll_rc_rate=5, roll_rate=30, roll_rate_limit=120))
+
+    assert command[command.index("--roll-rc-rate") + 1] == "5"
+    assert command[command.index("--roll-rate") + 1] == "30"
+    assert command[command.index("--roll-rate-limit") + 1] == "120"
+
+
 def test_safe_yaw_authority_fills_default_rate_profile():
     configured = apply_safe_yaw_authority(args(safe_yaw_authority=True))
 
@@ -333,6 +398,30 @@ def test_safe_yaw_authority_does_not_override_explicit_rate_values():
     assert configured.yaw_rc_rate == 6
     assert configured.yaw_rate == 40
     assert configured.yaw_rate_limit == 180
+
+
+def test_safe_manual_authority_fills_default_rate_profile():
+    configured = apply_safe_manual_authority(args(safe_manual_authority=True))
+
+    for axis in ("roll", "pitch", "yaw"):
+        assert getattr(configured, "%s_rc_rate" % axis) == SAFE_MANUAL_RC_RATE
+        assert getattr(configured, "%s_rate" % axis) == SAFE_MANUAL_RATE
+        assert getattr(configured, "%s_rate_limit" % axis) == SAFE_MANUAL_RATE_LIMIT
+
+
+def test_safe_manual_authority_does_not_override_explicit_rate_values():
+    configured = apply_safe_manual_authority(args(
+        safe_manual_authority=True,
+        pitch_rc_rate=6,
+        pitch_rate=40,
+        pitch_rate_limit=180,
+    ))
+
+    assert configured.pitch_rc_rate == 6
+    assert configured.pitch_rate == 40
+    assert configured.pitch_rate_limit == 180
+    assert configured.roll_rc_rate == SAFE_MANUAL_RC_RATE
+    assert configured.yaw_rate_limit == SAFE_MANUAL_RATE_LIMIT
 
 
 def test_debug_config_command_can_set_debug_mode():
@@ -402,6 +491,26 @@ def test_betaflight_work_dir_can_use_repo_directory(tmp_path):
     assert work_dir == Path(__file__).resolve().parents[1]
 
 
+def test_betaflight_config_file_resolves_relative_to_repo():
+    path = resolve_betaflight_config_file("config/sitl.txt")
+
+    assert path == Path(__file__).resolve().parents[1] / "config/sitl.txt"
+
+
+def test_betaflight_config_import_command_uses_sitl_binary(tmp_path):
+    config = tmp_path / "sitl_config.txt"
+    command = build_betaflight_config_import_command(
+        {"BETAFLIGHT_ROOT": "/tmp/betaflight"},
+        config,
+    )
+
+    assert command == [
+        "/tmp/betaflight/obj/main/betaflight_SITL.elf",
+        "--config",
+        str(config),
+    ]
+
+
 def test_bootstrap_gazebo_state_sends_zero_motor_packets(monkeypatch):
     calls = []
 
@@ -459,3 +568,34 @@ def test_analyze_motor_udp_log_reads_last_summary(tmp_path):
     assert summary["samples"] == 3
     assert summary["max_raw_spread"] == 945.0
     assert summary["max_abs_axis_bias_raw"]["yaw_cw_minus_ccw"] == 756.0
+
+
+def test_looptime_us_for_step_maps_step_to_microseconds():
+    assert looptime_us_for_step("0.001") == "1000"
+    assert looptime_us_for_step("0.0025") == "2500"
+
+
+def test_looptime_us_for_step_rejects_out_of_range_steps():
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        looptime_us_for_step("0.02")
+    with pytest.raises(RuntimeError):
+        looptime_us_for_step("0.00005")
+
+
+def test_lockstep_wait_env_value_passes_valid_microseconds():
+    assert lockstep_wait_env_value(4000) == "4000"
+    assert lockstep_wait_env_value(1) == "1"
+    assert lockstep_wait_env_value(1_000_000) == "1000000"
+
+
+def test_lockstep_wait_env_value_rejects_out_of_range_values():
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        lockstep_wait_env_value(0)
+    with pytest.raises(RuntimeError):
+        lockstep_wait_env_value(1_000_001)
+    with pytest.raises(RuntimeError):
+        lockstep_wait_env_value(-5)

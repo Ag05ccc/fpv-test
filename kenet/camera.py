@@ -11,6 +11,28 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Camera sources with this prefix are Gazebo camera topics, e.g.
+# "gz:/kenet/fpv_camera" (see kenet.gz_camera).
+GZ_SOURCE_PREFIX = "gz:"
+
+
+def is_gz_source(source):
+    return isinstance(source, str) and source.startswith(GZ_SOURCE_PREFIX)
+
+
+def create_camera_capture(source, width=640, height=480, fps=30, **gz_kwargs):
+    """Build the right capture backend for a camera source.
+
+    int / digit-string -> V4L2 device index, other string -> video file,
+    "gz:<topic>" -> live Gazebo camera topic over gz-transport.
+    """
+    if is_gz_source(source):
+        from .gz_camera import DEFAULT_FPV_TOPIC, GazeboCameraCapture
+        topic = source[len(GZ_SOURCE_PREFIX):] or DEFAULT_FPV_TOPIC
+        return GazeboCameraCapture(topic=topic, width=width, height=height,
+                                   fps=fps, **gz_kwargs)
+    return CameraCapture(source, width, height, fps)
+
 
 class CameraCapture:
     """Threaded camera capture. Grabs frames in a background thread so the

@@ -145,6 +145,39 @@ make TARGET=SITL
 ./obj/main/betaflight_SITL.elf      # RC input on UDP :9004, MSP on TCP :5761
 ```
 
+For hands-on FPV flying with no hardware at all — keyboard control, a forward
+FPV camera on the drone, and a world populated with people and cars — use:
+
+```bash
+./launch-fpv-sim.sh
+```
+
+It opens Gazebo's GUI with a docked "FPV Camera" panel (the drone's forward
+camera on `/kenet/fpv_camera`), starts Betaflight SITL with the measured SITL
+profile, and runs `tools/sitl_keyboard_rc.py` in the terminal: `w/s` throttle,
+`a/d` yaw, `i/k` pitch, `j/l` roll, `e` ARM, space = panic disarm, `q`/ESC =
+safe exit. Add `--input joystick` to fly with the physical transmitter
+instead. See `docs/sitl-quickstart.md` section 7 for details.
+
+For the simplest physical-RC simulation loop, use the single launcher from this
+repo root:
+
+```bash
+./launch-physical-rc-sim.sh
+```
+
+It opens Gazebo, starts Betaflight SITL, applies the measured SITL mode/PID
+profile plus a conservative roll/pitch/yaw manual rate profile
+(`rc_rate=5`, `rate=30`, `rate_limit=120` per axis), forces CH7/AUX3 to ANGLE
+at `1500`, and sends `/dev/input/js0` RC packets to UDP `9004`. Stop it with
+Ctrl-C; logs are written as
+`logs/sitl/<RUN>-*`. Before sending RC, it waits for throttle-low and ARM-low;
+do not arm until the launcher prints `READY`. It also starts the web dashboard
+at `http://127.0.0.1:8080` so RC channels, ARM/Kenet/mode state, MSP arming
+flags, motors, attitude, logs, and process buttons are visible during the run.
+While the dashboard is enabled, diagnostics reuse the dashboard MSP snapshot
+instead of opening a competing direct MSP reader.
+
 First prove the RC chain with just the transmitter. Check the mapping, then send
 the pilot sticks and switches to SITL:
 
@@ -229,6 +262,15 @@ export JOY_DEV="${JOY_DEV:-/dev/input/js0}"
 
 tools/check_sitl_env.sh
 tools/run_gazebo_betaflight.sh --world test_betaflight.sdf --headless
+```
+
+For the shortest no-hardware retest sequence, use
+`docs/sitl-quickstart.md`. For acceptance details and measured log evidence,
+use `docs/sitl-acceptance-procedure.md`.
+To summarize the current no-hardware evidence and external blockers, run:
+
+```bash
+fpv_env/bin/python tools/sitl_readiness_report.py
 ```
 
 For the Iris demo world, prefer the timing-isolated retest command while the
@@ -623,8 +665,9 @@ tracker, controller), so run it from the project venv.
   acceptance wrapper for the external checker plus `kenet_sitl_mixer.py
   --pilot-source virtual --synthetic-target`. Use `--profile centered` for the
   neutral target-found gate and yaw/pitch profiles for instability isolation.
-  It validates the mixer log for `TRACKING`, `target_found`, `source=kenet`, and
-  an optional `--max-abs-delta` limit before reporting PASS. Add
+  It validates the mixer log for `TRACKING`, `target_found`, `source=kenet`,
+  optional `--max-abs-delta`, and axis-specific `--min-abs-yaw-delta` /
+  `--min-abs-pitch-delta` or max-axis limits before reporting PASS. Add
   `--synthetic-target-loss-after-seconds`, `--min-target-lost-samples`, and
   `--min-ai-armed-samples` to turn the same run into a target-loss passthrough
   gate; keep `--virtual-hold-seconds` longer than the diagnostics window so
@@ -634,12 +677,15 @@ tracker, controller), so run it from the project venv.
   --pilot-source virtual --camera test-2.mp4`. Its default neutral gate proves
   `target_found=True` / `source=kenet` without commanding pitch/yaw; raise
   `--yaw-limit` / `--forward-limit` only for command-response tests. Use
-  `--kenet-delay-seconds 18 --yaw-pid 23,0,0` for the measured yaw4 video
-  command-response gate; yaw5 passed, yaw6 failed in the same profile, and
-  default pitch PID failed at pitch1 with `--yaw-limit 0`. Add
+  `--kenet-delay-seconds 18 --yaw-pid 23,0,0 --min-abs-yaw-delta 4` for the
+  measured yaw4 video command-response gate; yaw5 passed, yaw6 failed in the
+  same profile, and default pitch PID failed at pitch1 with `--yaw-limit 0`. Add
   `--pitch-pid 23,0,0` for the measured pitch gate: pitch5 passed and pitch6
   failed. With both axes active, the measured combined gate is yaw3+pitch3
   PASS and yaw4+pitch4 FAIL. Starting TRACKING during takeoff/ramp has failed.
+  Add `--target-loss-after-seconds`, `--min-target-lost-samples`, and
+  `--min-ai-armed-samples` to turn the same real-video path into a deterministic
+  target-loss passthrough/drop gate.
 - `sitl_configure_modes.py` — configures Betaflight SITL mode ranges over
   MSP/TCP without Configurator: ARM on AUX1/CH5 high, MSP Override on AUX2/CH6
   high, ANGLE on AUX3/CH7 mid, and HORIZON on AUX3/CH7 high. Use before
@@ -711,6 +757,13 @@ tracker, controller), so run it from the project venv.
   low/mid/high before re-enabling joystick SITL. If CH7 is not exposed by the
   transmitter yet, run it with `--force-mode-pwm 1500` to record the forced
   ANGLE profile used by `sitl_rc_bridge.py`.
+- `launch-physical-rc-sim.sh` — one-command physical-RC sim launcher. Starts
+  Gazebo, Betaflight SITL, the physical RC bridge, and short diagnostic captures
+  under a shared `logs/sitl/<RUN>-*` prefix. It waits for throttle-low and
+  ARM-low before enabling the RC sender, and opens `sitl_dashboard.py` on
+  `http://127.0.0.1:8080` for live state/process controls. Dashboard-enabled
+  diagnostics read MSP state through the dashboard API to avoid MSP port
+  contention.
 
 ---
 

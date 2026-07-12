@@ -60,6 +60,7 @@ def make_args(**overrides):
         "synthetic_target_height": 110.0,
         "synthetic_target_delay_seconds": 0.0,
         "synthetic_target_loss_after_seconds": None,
+        "target_loss_after_seconds": None,
         "synthetic_elapsed_seconds": 0.0,
         "aux_arm_threshold": 1300,
         "aux_track_threshold": 1700,
@@ -350,6 +351,19 @@ class LostTracker:
         self.reset_count += 1
 
 
+class FoundTracker:
+    is_initialized = True
+
+    def __init__(self):
+        self.reset_count = 0
+
+    def update(self, _frame):
+        return TrackResult(found=True, bbox=(10, 10, 20, 20), center=(20, 20))
+
+    def reset(self):
+        self.reset_count += 1
+
+
 class FakeFrame:
     shape = (480, 640, 3)
 
@@ -367,6 +381,32 @@ def test_target_loss_drops_mixer_to_ai_armed():
     assert result.found is False
     assert mixer.state == AI_ARMED
     assert mixer.prev_state == AI_ARMED
+    assert mixer.tracker.reset_count == 1
+
+
+def test_forced_camera_target_loss_drops_mixer_to_ai_armed():
+    mixer = make_mixer(target_loss_after_seconds=1.0, lost_seconds=0.2, loop_hz=10.0)
+    mixer.virtual_started = time.monotonic() - 1.1
+    mixer.tracker = FoundTracker()
+    mixer.state = TRACKING
+    mixer.prev_state = TRACKING
+    pilot = pilot_channels()
+    pilot[mixer.args.aux_ch] = 2000
+
+    first = mixer._update_vision_state(FakeFrame(), pilot)
+    first_final = mixer._mix_channels(pilot, first)
+    first_source = mixer.last_source
+    second = mixer._update_vision_state(FakeFrame(), pilot)
+    second_final = mixer._mix_channels(pilot, second)
+
+    assert first.found is False
+    assert first_final == pilot
+    assert first_source == "pilot-target-lost"
+    assert second.found is False
+    assert second_final == pilot
+    assert mixer.state == AI_ARMED
+    assert mixer.prev_state == AI_ARMED
+    assert mixer.tracking_reentry_blocked is True
     assert mixer.tracker.reset_count == 1
 
 

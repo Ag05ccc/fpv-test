@@ -280,8 +280,11 @@ class ProcessManager:
                 proc = self.processes.get(name)
                 running = proc is not None and proc.poll() is None
                 returncode = None if proc is None else proc.poll()
+                external_message = None if running else self._external_running_message(name)
                 result[name] = {
                     "running": running,
+                    "external_running": bool(external_message),
+                    "external_message": external_message,
                     "pid": None if proc is None else proc.pid,
                     "returncode": returncode,
                     "log_path": str(self._log_path(name)),
@@ -1289,14 +1292,17 @@ function renderProcess(name, proc) {
   const command = document.getElementById(`${name}Command`);
   const log = document.getElementById(`${name}Log`);
   if (!proc) return;
-  const status = proc.running ? `running pid ${proc.pid}` : (proc.pid ? `stopped rc ${proc.returncode}` : 'not started');
+  const status = proc.running
+    ? `running pid ${proc.pid}`
+    : (proc.external_running ? 'external active' : (proc.pid ? `stopped rc ${proc.returncode}` : 'not started'));
   if (badge) {
     badge.textContent = status;
-    badge.className = 'badge' + (proc.running ? ' running' : '');
+    badge.className = 'badge' + ((proc.running || proc.external_running) ? ' running' : '');
   }
   if (command) {
     const commandText = (proc.command || []).join(' ');
-    command.textContent = proc.working_dir ? `${commandText} | cwd ${proc.working_dir}` : commandText;
+    const externalText = proc.external_message ? ` | ${proc.external_message}` : '';
+    command.textContent = proc.working_dir ? `${commandText} | cwd ${proc.working_dir}${externalText}` : `${commandText}${externalText}`;
   }
   if (log) {
     const text = proc.log_tail || '';

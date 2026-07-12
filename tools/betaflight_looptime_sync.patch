@@ -1,0 +1,66 @@
+diff --git a/src/main/sensors/gyro_init.c b/src/main/sensors/gyro_init.c
+index 64dd6ae06..197a07db3 100644
+--- a/src/main/sensors/gyro_init.c
++++ b/src/main/sensors/gyro_init.c
+@@ -766,6 +766,38 @@ uint8_t getGyroDetectedFlags(void)
+     return gyroDetectedFlags;
+ }
+ 
++// KENET_SITL_LOOPTIME_SYNC_BEGIN
++#if defined(SIMULATOR_BUILD)
++#include <stdio.h>
++// SITL lockstep looptime override. With ENABLE_SIMULATOR_GYROPID_SYNC the PID
++// loop executes at most once per FDM packet, but pidRuntime.dT and every
++// filter are initialized from the virtual gyro's claimed 8 kHz sample rate
++// (125 us). Set KENET_SITL_LOOPTIME_US to the FDM step in microseconds
++// (valid range 100..10000) to make the gyro/PID looptimes claim that step, so
++// dT, I accumulation, D scaling, and all filter inits match the real step.
++// Unset or invalid values leave behavior bit-for-bit identical to stock.
++static uint32_t kenetSitlLooptimeOverrideUs(void)
++{
++    static int32_t cachedUs = -1;
++    if (cachedUs < 0) {
++        cachedUs = 0;
++        const char *env = getenv("KENET_SITL_LOOPTIME_US");
++        if (env != NULL && *env != '\0') {
++            char *end = NULL;
++            const long value = strtol(env, &end, 10);
++            if (end != NULL && *end == '\0' && value >= 100 && value <= 10000) {
++                cachedUs = (int32_t)value;
++                fprintf(stderr, "[SITL] KENET_SITL_LOOPTIME_US=%ld us: gyro/PID looptime override active\n", value);
++            } else {
++                fprintf(stderr, "[SITL] KENET_SITL_LOOPTIME_US='%s' invalid (expect integer 100..10000 us), ignored\n", env);
++            }
++        }
++    }
++    return (uint32_t)cachedUs;
++}
++#endif
++// KENET_SITL_LOOPTIME_SYNC_END
++
+ void gyroSetTargetLooptime(uint8_t pidDenom)
+ {
+     activePidLoopDenom = pidDenom;
+@@ -776,6 +808,22 @@ void gyroSetTargetLooptime(uint8_t pidDenom)
+         gyro.sampleLooptime = 0;
+         gyro.targetLooptime = 0;
+     }
++// KENET_SITL_LOOPTIME_SYNC_BEGIN
++#if defined(SIMULATOR_BUILD)
++    {
++        const uint32_t overrideUs = kenetSitlLooptimeOverrideUs();
++        if (overrideUs != 0) {
++            // Keep all three fields consistent: the scheduler (fc/tasks.c)
++            // reschedules TASK_GYRO/TASK_FILTER/TASK_PID from sampleLooptime/
++            // targetLooptime, pidInit() takes dT from targetLooptime, and
++            // MSP_BOARD_INFO plus validateAndFixGyroConfig read sampleRateHz.
++            gyro.sampleRateHz = 1000000 / overrideUs;
++            gyro.sampleLooptime = overrideUs;
++            gyro.targetLooptime = activePidLoopDenom * overrideUs;
++        }
++    }
++#endif
++// KENET_SITL_LOOPTIME_SYNC_END
+ }
+ 
+ gyroDev_t *gyroActiveDev(void)

@@ -47,7 +47,9 @@ def test_update_rate_config_changes_only_requested_yaw_fields():
     assert updated["yaw_rc_rate"] == 5
     assert updated["yaw_rate"] == 30
     assert updated["yaw_rate_limit"] == 120
+    assert updated["roll_rc_rate"] == parsed["roll_rc_rate"]
     assert updated["roll_rate_limit"] == parsed["roll_rate_limit"]
+    assert updated["pitch_rc_rate"] == parsed["pitch_rc_rate"]
     assert updated["pitch_rate_limit"] == parsed["pitch_rate_limit"]
 
 
@@ -60,6 +62,40 @@ def test_update_rate_config_can_change_pitch_fields():
     assert updated["pitch_rate_limit"] == 120
     assert updated["yaw_rc_rate"] == parsed["yaw_rc_rate"]
     assert updated["yaw_rate_limit"] == parsed["yaw_rate_limit"]
+
+
+def test_update_rate_config_can_change_roll_fields():
+    parsed = parse_rate_payload(sample_payload())
+    updated = update_rate_config(parsed, roll_rc_rate=5, roll_rate=30, roll_rate_limit=120)
+
+    assert updated["roll_rc_rate"] == 5
+    assert updated["roll_rate"] == 30
+    assert updated["roll_rate_limit"] == 120
+    assert updated["pitch_rc_rate"] == parsed["pitch_rc_rate"]
+    assert updated["pitch_rate_limit"] == parsed["pitch_rate_limit"]
+    assert updated["yaw_rc_rate"] == parsed["yaw_rc_rate"]
+    assert updated["yaw_rate_limit"] == parsed["yaw_rate_limit"]
+
+
+def test_update_rate_config_can_change_manual_axis_fields_together():
+    parsed = parse_rate_payload(sample_payload())
+    updated = update_rate_config(
+        parsed,
+        roll_rc_rate=5,
+        roll_rate=30,
+        roll_rate_limit=120,
+        pitch_rc_rate=5,
+        pitch_rate=30,
+        pitch_rate_limit=120,
+        yaw_rc_rate=5,
+        yaw_rate=30,
+        yaw_rate_limit=120,
+    )
+
+    for axis in ("roll", "pitch", "yaw"):
+        assert updated["%s_rc_rate" % axis] == 5
+        assert updated["%s_rate" % axis] == 30
+        assert updated["%s_rate_limit" % axis] == 120
 
 
 def test_rate_value_parsers_validate_ranges():
@@ -78,7 +114,8 @@ def test_format_rate_config_is_compact():
     parsed = parse_rate_payload(sample_payload())
 
     assert format_rate_config("before", parsed) == (
-        "before yaw_rc_rate=7 yaw_rate=67 yaw_rate_limit=1998 "
+        "before roll_rc_rate=7 roll_rate=67 roll_rate_limit=1998 "
         "pitch_rc_rate=7 pitch_rate=67 pitch_rate_limit=1998 "
-        "roll_limit=1998 pitch_limit=1998 rates_type=0"
+        "yaw_rc_rate=7 yaw_rate=67 yaw_rate_limit=1998 "
+        "rates_type=0"
     )

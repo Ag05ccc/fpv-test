@@ -20,8 +20,17 @@ Usage:
 """
 
 import argparse
-from kenet import PipelineConfig, TrackingPipeline, PIDGains
+from kenet import PipelineConfig, TrackingPipeline
 from kenet.state_machine import DEFAULT_KENET_AUX_CH
+
+
+def _apply_pid_override(gains, kp, ki, kd):
+    if kp is not None:
+        gains.kp = kp
+    if ki is not None:
+        gains.ki = ki
+    if kd is not None:
+        gains.kd = kd
 
 
 def main():
@@ -32,6 +41,14 @@ def main():
     ap.add_argument("--camera", default="0",
                     help="Camera index (0,1,...) or video file path")
     ap.add_argument("--tracker", default="CSRT", choices=["CSRT", "KCF"])
+    # PID tuning overrides. Defaults live in PipelineConfig (single source);
+    # a flag left unset keeps that default so tune runs are config-tracked.
+    ap.add_argument("--yaw-kp", type=float, default=None)
+    ap.add_argument("--yaw-ki", type=float, default=None)
+    ap.add_argument("--yaw-kd", type=float, default=None)
+    ap.add_argument("--forward-kp", type=float, default=None)
+    ap.add_argument("--forward-ki", type=float, default=None)
+    ap.add_argument("--forward-kd", type=float, default=None)
     ap.add_argument("--aux-ch", default=DEFAULT_KENET_AUX_CH, type=int,
                     help="3-position AUX channel (0-indexed, default=5 / CH6 / AUX2)")
     ap.add_argument("--track-size", default=100, type=int,
@@ -96,9 +113,12 @@ def main():
         gcs_host=args.gcs_host,
         gcs_port=args.gcs_port,
         gcs_enabled=not args.no_gcs,
-        yaw_pid=PIDGains(kp=0.8, ki=0.05, kd=0.15, output_min=-300, output_max=300),
-        forward_pid=PIDGains(kp=0.4, ki=0.02, kd=0.1, output_min=-250, output_max=250),
     )
+    # PipelineConfig holds the default gains; apply CLI overrides in place so
+    # there is a single source of truth for the tune.
+    _apply_pid_override(cfg.yaw_pid, args.yaw_kp, args.yaw_ki, args.yaw_kd)
+    _apply_pid_override(cfg.forward_pid, args.forward_kp, args.forward_ki,
+                        args.forward_kd)
 
     pipeline = TrackingPipeline(cfg)
 

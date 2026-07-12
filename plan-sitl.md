@@ -1,5 +1,15 @@
 # Kenet / Betaflight SITL Yol Haritası
 
+> **ARŞİV NOTU (2026-07-02):** Bu doküman büyük ölçüde tamamlanmış bir
+> checklist'tir ve artık canlı plan değildir. Güncel durum için `CLAUDE.md`
+> (durum özeti), `docs/virtual-rc-gazebo-roadmap.md` (strateji),
+> `docs/sitl-flight-readiness-criteria.md` (ölçülebilir kabul kriterleri) ve
+> `docs/sitl-quickstart.md` / `docs/sitl-acceptance-procedure.md` (prosedür)
+> kullanılır. Buradaki "sıradaki iş" bölümleri güncel değildir; P0–P10
+> fazlarının çoğu kapanmış veya ölçülmüş sonuçlarla aşılmıştır. Ayrıca
+> 2026-07-02 kararıyla fiziksel RC hiçbir kapının ön şartı değildir; tüm
+> geliştirme/test sanal RC ile yürür.
+
 Amaç: Gerçek drone'a geçmeden önce Kenet'in kontrol zincirini masaüstünde
 kanıtlamak. Plan mümkün olduğunca sade tutulur: önce RC ve Betaflight SITL
 zinciri, sonra Kenet'in görsel takip çıktısı, en son gerekirse MSP ve fizik
@@ -400,6 +410,23 @@ Kabul kriterleri:
   sürdüğü için `--betaflight-restart-settle-seconds` eklendi; varsayılan
   2 saniye bekleme ile P21 instrumented PASS koşusu tamamlandı. Hedefli testler
   bootstrap ve summary aktif-debug helper'larını kapsıyor.
+- [~] Claude'un sonraki `flipfix-*` provoke denemeleri tekrar ayrıştırıldı.
+  `tools/analyze_sitl_log.py --per-path` artık her JSONL için ayrı PASS/FAIL
+  satırı üretiyor. 2026-06-30 kontrolünde `flipfix-final*`, `recheck`,
+  `velp01`, `veli`, `veli05`, `fcp5`, `conf-*`, `d40`, `trial1`, `trial2`
+  dosyalarının tamamı FAIL çıktı: tipik imza `yaw_delta=+150` veya negatif
+  denemede `-150`, MSP motor spread `945`, max roll çoğu koşuda `180 deg`.
+  Bu denemeler safe-yaw P23/yaw1504 kabul kapısını çürütmüyor; daha büyük yaw
+  authority/provoke penceresinin hâlâ açık problem olduğunu gösteriyor. Planın
+  güncel sınırı: kabul edilen virtual-RC/video testleri safe-yaw, gecikmeli
+  Kenet state ve ölçülü komut limitleriyle ilerleyecek; yaw authority
+  genişletilecekse ayrı braket ve kabul eşiğiyle koşulacak.
+- [x] Command-response kabul kapıları eksen bazında sertleştirildi.
+  `tools/sitl_video_tracking_check.py` ve `tools/sitl_synthetic_tracking_check.py`
+  artık `--min-abs-yaw-delta`, `--min-abs-pitch-delta`,
+  `--max-abs-yaw-delta`, `--max-abs-pitch-delta` destekliyor. Böylece PASS
+  yalnızca "takla yok" değil, beklenen yaw/pitch komutunun gerçekten üretildiği
+  ve izin verilen eksen penceresinde kaldığı anlamına geliyor.
 
 Virtual RC ile ilk Gazebo kabul sırası:
 
@@ -1167,13 +1194,24 @@ MSP'ye geçmeden önce şartlar:
 - [x] Configurator Receiver tab çalıştı.
 - [x] Kenet mixer TRACKING sırasında pitch/yaw üretti.
 - [x] PID yönleri doğrulandı: `tools/sitl_pid_direction_check.py` PASS.
-- [~] Hedef kaybı ve state geçişleri test matrisi tamamlandı: production/SITL
+- [x] Hedef kaybı ve state geçişleri test matrisi tamamlandı: production/SITL
   unit gate, P11 AUX drop canlı smoke ve sentetik target-loss runner gate'i
   geçti; uzun hedef kaybından sonra yeniden TRACKING için pilotun switch'i
   track eşiğinin altına indirip tekrar HIGH yapması gerekiyor. Gerçek
   kamera/video target-loss matrisi ayrı koşulabilir. Canlı sentetik target-loss
   PASS: `logs/sitl/20260630-synthetic-target-loss-live-final-diagnostics.jsonl`
   ve `logs/sitl/20260630-synthetic-target-loss-live-final-mixer.jsonl`.
+- [x] Gerçek video target-loss gate'i canlı koşuda geçti.
+  `tools/kenet_sitl_mixer.py --target-loss-after-seconds` gerçek camera/video
+  yolu açıkken target-loss geçişini deterministik tetikleyebiliyor;
+  `tools/sitl_video_tracking_check.py` bunu geçirip `source=pilot-target-lost`
+  ve `AI-ARMED` sample sayılarını kabul kriteri yapıyor. Canlı PASS:
+  `logs/sitl/20260630-video-target-loss-p23-delay18-final-diagnostics.jsonl`,
+  `logs/sitl/20260630-video-target-loss-p23-delay18-final-mixer.jsonl`,
+  `logs/sitl/20260630-video-target-loss-p23-delay18-final-motor-udp.jsonl`.
+  Özet: altitude gain `30.175 m`, max roll/pitch `0/0`, motor/raw spread `0`,
+  mixer `target_found/source=kenet 31`, `pilot-target-lost 40`,
+  `AI-ARMED 265`, max pitch/yaw delta `0/0`.
 
 Karar:
 
@@ -1426,7 +1464,12 @@ Gazebo için uygulama yolu:
   ölçümü yapılabilir.
 - [x] Dashboard `Start Gazebo`, `--gazebo-max-step-size` ile aynı timing
   izolasyonunu kullanabilir.
-- [ ] `tools/check_sitl_env.sh` ile başka makinelerde ortam raporu alınacak.
+- [~] `tools/check_sitl_env.sh` bu makinede geçti ve quickstart'a bağlandı;
+  başka makinede ortam raporu almak dış makine erişimi bekliyor.
+- [x] `tools/sitl_readiness_report.py` eklendi. Bu rapor no-hardware kanıt
+  loglarını ve dış gate'leri tek yerde özetliyor; bu makinede no-hardware
+  `PASS`; fiziksel RC cihaz algılama artık `READY` (`/dev/input/js0`), kanal
+  hareket/preflight coverage ve başka makine env raporu hâlâ dış gate.
 - [x] Hazır Iris world ile gövde/uçuş fiziği gözlendi: virtual takeoff,
   synthetic tracking, gerçek video tracking ve raw motor UDP acceptance
   koşuları bu world üzerinde loglandı.
@@ -1530,8 +1573,10 @@ Kabul kriteri:
   `20260630-video-target-found-yaw2-pitch2-p23-delay18-pitchpid23-*` ve
   `20260630-video-target-found-yaw3-pitch3-p23-delay18-pitchpid23-*` PASS;
   `20260630-video-target-found-yaw4-pitch4-p23-delay18-pitchpid23-*` FAIL.
-- [~] Sim kurulumu `README.md`, `plan-sitl.md` ve `latest-development.md`
-  içinde dokümante edildi; ayrı kısa kullanım dokümanı ileride eklenebilir.
+- [x] Sim kurulumu `README.md`, `plan-sitl.md`, `latest-development.md` ve
+  `docs/sitl-quickstart.md` içinde dokümante edildi. Quickstart; env check,
+  no-hardware gate'ler, safe-yaw takeoff, real video neutral, command-response,
+  target-loss ve log triage sırasını tek yerde topluyor.
 
 ---
 
@@ -1539,20 +1584,65 @@ Kabul kriteri:
 
 SITL'den gerçek FC testine geçmeden önce:
 
-- [~] UDP mixer/test matrisi virtual/synthetic ve gerçek video neutral hatlarda
-  tamamlandı. Safe-yaw virtual RC acceptance, video target-found neutral ve
-  gecikmeli video yaw2/yaw4/yaw5 command-response PASS; gecikmeli video yaw6
-  ve yaw8 FAIL. Pitch-only video command-response default PID ile pitch1/pitch2
-  FAIL; pitch PID `23/0/0` ile pitch1/pitch2/pitch4/pitch5 PASS, pitch6 FAIL.
-  Birleşik pitch+yaw video command-response tarafında yaw3+pitch3 PASS,
-  yaw4+pitch4 FAIL. Fiziksel RC açık.
+- [x] No-hardware UDP mixer/test matrisi virtual, synthetic ve gerçek video
+  hatlarda tamamlandı. Safe-yaw virtual RC acceptance, video target-found
+  neutral, real-video target-loss ve gecikmeli command-response gate'leri
+  kanıtlandı. Yaw tarafında yaw5 PASS / yaw6 FAIL; pitch tarafında pitch PID
+  `23/0/0` ile pitch5 PASS / pitch6 FAIL; birleşik pitch+yaw tarafında
+  yaw3+pitch3 PASS / yaw4+pitch4 FAIL.
+- [~] Aynı acceptance kriterleriyle fiziksel RC yolu ayrı doğrulanacak.
+  2026-06-30 fiziksel TBS joystick `/dev/input/js0` olarak göründü; raw init
+  değerleri okunuyor, ancak no-send preflight sırasında CH5/CH6/CH7 hareket
+  event'i yakalanmadı. Kullanıcı doğrudan simülasyon uçuşu istediği için
+  `launch-physical-rc-sim.sh` eklendi; bu launcher Gazebo GUI + Betaflight SITL
+  + fiziksel RC bridge'i tek komutla açıyor, RC göndermeden önce throttle düşük
+  ve ARM kapalı bekliyor, MSP-ready yarışında Betaflight restart retry yapıyor
+  ve `sitl_dashboard.py` web arayüzünü `http://127.0.0.1:8080` üzerinde açıyor.
+  Dashboard açıkken diagnostics MSP bilgisini dashboard API'sinden alıyor; MSP
+  portunda ikinci doğrudan okuyucu açılmıyor.
+  İlk canlı fiziksel RC koşusu `20260630-225622-physical-rc-launch` kontrol
+  plumbing'ini doğruladı ama ileri-geri/pitch ekseninde osilasyonla bitti:
+  pilot kanalları FC RC kanallarıyla eşleşti, fakat pitch stick yaklaşık
+  `1397-1407` aralığındayken attitude `pitch=80.6`, `roll=178.7` seviyesine
+  sıçradı ve araç ters kaldı. Bu sırada launcher yalnız safe-yaw rate profilini
+  uyguluyordu; roll/pitch manuel authority default/agresif kaldı. Düzeltme:
+  `sitl_rate_config.py` roll alanlarını da güncelleyebilir hale getirildi ve
+  `launch-physical-rc-sim.sh` artık roll/pitch/yaw için güvenli manuel profile
+  (`rc_rate=5`, `rate=30`, `rate_limit=120`) geçiyor. Sıradaki gate aynı
+  fiziksel RC testini yeni profille tekrarlayıp max roll/pitch, altitude ve
+  arming/mode durumunu logdan kıyaslamak.
+  İkinci koşu `20260630-232217-physical-rc-launch` bu profili doğru uyguladı
+  ama yine FAIL verdi. Bu sefer RC aralığı çok küçük kaldı: roll/yaw nötr,
+  Kenet `IDLE`, pitch yalnızca `1495..1522`. Ham motor UDP'de ilk büyük spread
+  saf pitch ekseninden geldi (`spread>200` anında roll/yaw bias `0`, pitch bias
+  yaklaşık `+200 us`; `spread>900` anında pitch bias yaklaşık `-910 us`).
+  Virtual ayrım: `20260630-virtual-physical-repro-neutral1475` PASS, aynı
+  throttle'da `pitch=1522` nudge içeren
+  `20260630-virtual-physical-repro-pitch1522` FAIL. Bu nedenle fiziksel RC
+  ana kök neden olmaktan çıktı; sıradaki gate küçük pitch command-response /
+  ANGLE-level loop penceresini virtual RC ile bracket etmek.
+  2026-07-01 bracket sonucu temel resmi-doküman kontrolünü değiştirdi:
+  Betaflight Gazebo SITL dokümanı `9002/9003/9004` UDP mimarisiyle uyumlu;
+  eski SITL notları `max_step_size` için `0.0025` üstüne çıkma diyor. Bizim
+  modelde `0.0025` hâlâ acceptance için kaba kaldı: `pitch1505` PASS, fakat
+  `pitch1510/1515/1520/1522` geçerli FAIL ve ilk büyük raw motor split saf
+  pitch (`~400 us`) olarak geldi. `sitl_virtual_takeoff_check.py` ayrıca FAIL
+  sonrası child `gz sim` sürecini kaçırıp UDP `9002` bind'ini tutabiliyordu;
+  bu invalid `ARM+ANGLE=0` tekrarları yarattı ve process-group cleanup ile
+  düzeltildi. Aynı profil `--max-step-size 0.001` ile `pitch1510` ve
+  `pitch1522` PASS verdi (`raw spread 3.126/12.972`, max attitude
+  `0/0.3` ve `0/1.3`). Sonuç: fiziksel RC launcher ve virtual acceptance
+  default'u `0.001` olmalı. `/home/gz/betaflight/sitl_config.txt` import'u
+  için `--betaflight-config-file` eklendi; config import tek başına `0.0025`
+  pitch kopmasını kapatmadı.
 - [x] PID yönleri doğru.
 - [x] Hedef kaybı güvenli.
 - [x] MSP transport testi başarılı.
 - [x] Throttle/roll override riski kapatıldı.
 - [~] ARM ve Kenet state switch'leri virtual/log hattında ayrı kanallarda net;
-  fiziksel bench doğrulaması için no-send preflight hazır, canlı koşu
-  `/dev/input/js*` bekliyor.
+  fiziksel bench doğrulaması için no-send preflight hazır. `/dev/input/js0`
+  mevcut, sıradaki gate CH5/AUX1 low/high, CH6/AUX2 low/mid/high ve gerekirse
+  CH7/AUX3 veya `--force-mode-pwm 1500` profilinin hareketli doğrulaması.
 - [x] GCS/log ile state geçişleri izlenebiliyor.
 - [x] Test prosedürü yazılı: `docs/sitl-acceptance-procedure.md`.
 
@@ -1680,13 +1770,13 @@ En yakın pratik sıra:
    bekliyor.
 15. [x] PID yönlerini bilinçli hedef hareketleriyle doğrula:
    `tools/sitl_pid_direction_check.py` PASS.
-16. [~] Hedef kaybı durumunda pilot passthrough davranışını doğrula. Production
+16. [x] Hedef kaybı durumunda pilot passthrough davranışını doğrula. Production
    pipeline ve SITL mixer unit gate'leri geçti; sentetik target-loss runner
    `pilot-target-lost` ve `AI-ARMED` sample gate'leriyle eklendi. Target-loss
    sonrası re-entry lockout production/SITL ortak davranış: switch track
    eşiğinin altına inmeden tekrar TRACKING yok. Canlı final gate PASS:
    `20260630-synthetic-target-loss-live-final`; gerçek video/kamera target-loss
-   matrisi hâlâ ayrı koşulabilir.
+   canlı gate'i de PASS: `20260630-video-target-loss-p23-delay18-final`.
 17. [x] JSONL log ve `tools/analyze_sitl_log.py` eklendi.
 18. [x] MSP için `socat` pseudo serial yolu aktif ön koşul olmaktan çıkarıldı.
    Native TCP üretim yolu eklendi ve geçti; socat sadece opsiyonel regresyon
@@ -1700,13 +1790,17 @@ En yakın pratik sıra:
    `tools/sitl_diagnostics.py` ile Gazebo RTF, MSP arm blocker, RC delta ve
    motor mapping loglansın.
 25. [~] Fiziksel Tango/joystick RC yolu virtual RC sonucu netleşince tekrar
-   doğrulanacak. Bu oturumda `/dev/input/js*` görünmediği için canlı fiziksel
-   retest koşturulamadı; bunun yerine takeoff checker'a `--rc-driver external`
-   ve no-send `tools/sitl_physical_rc_preflight.py` eklendi.
+   doğrulanacak. `/dev/input/js0` artık görünüyor ve init axis/button değerleri
+   okunuyor; fakat son preflight/dry-run pencerelerinde hareket event'i
+   yakalanmadı. Takeoff checker'daki `--rc-driver external` ve no-send
+   `tools/sitl_physical_rc_preflight.py` hazır; canlı fiziksel retest için önce
+   switch/stick hareket coverage'ı PASS olmalı.
 26. [x] Kenet mixer + Gazebo hattında sanal pilot / hedef-yok passthrough
    davranışını test et.
-27. [~] Kenet mixer + Gazebo hattında sentetik target-found TRACKING davranışını
-   test et; centered target-found harness PASS, offsetli kabul FAIL.
+27. [x] Kenet mixer + Gazebo hattında sentetik target-found TRACKING davranışını
+   test et. Centered target-found harness PASS; offsetli sentetik koşular
+   bilinçli FAIL kanıtı olarak kaydedildi ve güvenli command-response kabulü
+   gerçek video + gecikmeli Kenet state penceresine taşındı.
 28. [x] Gerçek kamera/video target-found TRACKING kabul testini aynı kriterlerle
    koş. `tools/sitl_video_tracking_check.py --camera test-2.mp4 --run-id
    20260630-video-target-found-neutral` PASS: diagnostics altitude gain
