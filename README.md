@@ -1,5 +1,7 @@
 # Kenet
 
+![Kenet closed-loop tracking in pr0p](pr0p-test-1.gif)
+
 Visual target tracking + PID control + Betaflight MSP for FPV drones.
 
 A camera feeds an OpenCV tracker, a PID controller turns the target's position
