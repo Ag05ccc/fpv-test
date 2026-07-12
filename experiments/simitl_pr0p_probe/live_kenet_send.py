@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Live Kenet YAW closed-loop for pr0p (yaw-only, mux + smoothing).
+"""Live Kenet YAW+PITCH closed-loop for pr0p (mux + smoothing, dry pilot fallback).
 
-Creates the virtual "Kenet Game Sandbox" joystick and drives ONLY its yaw axis.
-Bind pr0p's YAW channel to this virtual device; keep roll/pitch/throttle on the
-TBS. The viewer is a yaw MUX:
-  * normally: pass the pilot's TBS yaw through to the virtual device,
-  * CH6 == TRACKING (and locked on the center target): Kenet's smoothed yaw
-    takes over (low authority + slew-rate limit so it is gentle).
-Roll/pitch/throttle are untouched (still the pilot's TBS -> pr0p, direct).
+Creates the virtual "Kenet Game Sandbox" joystick and feeds it every axis:
 
-Keys (focus the viewer window): b=toggle YAW BIND pulse (oscillate virtual yaw
-so pr0p can bind to it -- do this DISARMED/on the ground), space=manual lock,
-r=unlock, i=invert Kenet yaw sign, p=invert pilot-passthrough sign, q=quit.
+  * yaw   : MUX -- pilot's TBS yaw normally; Kenet's smoothed yaw when CH6 ==
+            TRACKING and locked on the center target.
+  * pitch : MUX -- same, for pitch (Kenet's approach/forward command).
+  * roll  : always the pilot's TBS roll (passthrough).
+  * thr   : always the pilot's TBS throttle (passthrough).
+
+Roll/throttle are passed through as a SAFETY NET: pr0p still has generic
+`<Joystick>/Stick/x` style bindings for some channels, which are ambiguous once
+two joysticks exist -- by mirroring the pilot's stick onto the virtual device,
+the pilot's input reaches pr0p no matter which device a generic binding resolves
+to. Bind pr0p's YAW and PITCH to this virtual device; leave the rest as-is.
+
+Bind helper: while the yaw/pitch bind-flag file exists, that axis does a strong
+step-and-hold pulse (0 -> +0.9 -> 0) so pr0p's interactive rebind locks onto it.
+Unity's rebind ignores continuously-moving ("noisy") controls, which is why this
+is a step and not a wave. Bind only while DISARMED / on the ground.
+
+Keys (viewer window focused): space=manual lock, r=unlock, i/o=invert Kenet
+yaw/pitch, q=quit.
 """
 from __future__ import annotations
 
-import math
+import json
 import os
 import sys
 import time
@@ -40,21 +50,29 @@ def clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
 
 
-def resolve_region(title, retries=1):
+def resolve_region(title, retries=1, exact=False):
+    # exact=True matters: a terminal sitting in .../simitl-pr0p has "pr0p" in its
+    # title and would otherwise be captured instead of the game window.
     last = None
     for _ in range(max(1, retries)):
         try:
-            return resolve_capture_region(window_title=title, window_min_width=200,
-                                          window_min_height=200)
+            return resolve_capture_region(window_title=title, window_exact=exact,
+                                          window_min_width=200, window_min_height=200)
         except Exception as e:
             last = e
             time.sleep(0.5)
     raise last
 
 
+def step_pulse(now, t0):
+    """Strong 0 -> +0.9 -> 0 step, repeating every 1.5 s."""
+    return 0.9 if ((now - t0) % 1.5) < 1.0 else 0.0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--window-title", default="pr0p")
+    ap.add_argument("--window-exact", action="store_true")
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--joy-device", default="/dev/input/js0")
     ap.add_argument("--center-w", type=int, default=96)
@@ -62,41 +80,60 @@ def main() -> int:
     ap.add_argument("--tracker", default="CSRT")
     ap.add_argument("--win-x", type=int, default=1960)
     ap.add_argument("--win-y", type=int, default=40)
-    ap.add_argument("--yaw-authority", type=float, default=0.40,
-                    help="scale on Kenet yaw command (gentle)")
-    ap.add_argument("--max-yaw", type=float, default=0.30, help="abs cap on virtual yaw")
-    ap.add_argument("--yaw-slew", type=float, default=0.03, help="max yaw change per frame")
+    ap.add_argument("--yaw-authority", type=float, default=0.40)
+    ap.add_argument("--max-yaw", type=float, default=0.30)
+    ap.add_argument("--yaw-slew", type=float, default=0.03)
+    ap.add_argument("--pitch-authority", type=float, default=0.35)
+    ap.add_argument("--max-pitch", type=float, default=0.25)
+    ap.add_argument("--pitch-slew", type=float, default=0.025)
     ap.add_argument("--invert-kenet-yaw", action="store_true")
+    ap.add_argument("--invert-kenet-pitch", action="store_true")
     ap.add_argument("--invert-pilot-yaw", action="store_true")
+    ap.add_argument("--invert-pilot-pitch", action="store_true")
+    ap.add_argument("--no-kenet-pitch", action="store_true",
+                    help="keep pitch on the pilot even while tracking (yaw-only stage)")
+    ap.add_argument("--desired-target-width", type=float, default=260.0,
+                    help="Kenet pitches forward until the tracked target is this wide "
+                         "(px). Must be well above the lock-box width or the approach "
+                         "error is ~0 and Kenet never pitches.")
     ap.add_argument("--geom-poll-s", type=float, default=1.0)
-    ap.add_argument("--bind-flag", default="/tmp/kenet_bind_yaw.flag",
-                    help="while this file exists, step-pulse the virtual yaw for pr0p binding")
+    ap.add_argument("--bind-flag-yaw", default="/tmp/kenet_bind_yaw.flag")
+    ap.add_argument("--bind-flag-pitch", default="/tmp/kenet_bind_pitch.flag")
+    # Sign flips via flag files: focusing the viewer mid-flight would make pr0p
+    # lose focus and stop reading RC, so the sign must be fixable without focus.
+    ap.add_argument("--invert-flag-yaw", default="/tmp/kenet_invert_yaw.flag")
+    ap.add_argument("--invert-flag-pitch", default="/tmp/kenet_invert_pitch.flag")
+    # Live gain tuning without a restart (a restart re-creates the uinput device,
+    # which briefly drops the pilot's yaw/pitch -- unsafe mid-flight).
+    ap.add_argument("--tune-file", default="/tmp/kenet_tune.json",
+                    help="optional JSON: yaw_authority, max_yaw, yaw_slew, "
+                         "pitch_authority, max_pitch, pitch_slew")
     args = ap.parse_args()
 
-    # Virtual device first (so pr0p can enumerate/bind it).
     adapter = UInputAdapter(name="Kenet Game Sandbox")
     adapter.neutral()
-    print("virtual joystick 'Kenet Game Sandbox' created (yaw=ABS_RX)", flush=True)
+    print("virtual joystick 'Kenet Game Sandbox' created (yaw=ABS_RX pitch=ABS_Y)", flush=True)
 
     joy = LinuxJoystick(args.joy_device)
     joy.open()
     print("joystick open: %s" % args.joy_device, flush=True)
 
-    region = resolve_region(args.window_title, retries=30)
+    print("waiting for the pr0p window (launch pr0p now)...", flush=True)
+    region = resolve_region(args.window_title, retries=240, exact=args.window_exact)
     W, H = region["width"], region["height"]
     print("pr0p region %s" % region, flush=True)
 
     def build_size_state(w, h):
-        cfg = LoopConfig(frame_width=w, frame_height=h, enable_pitch=True)
+        cfg = LoopConfig(frame_width=w, frame_height=h, enable_pitch=True,
+                         desired_target_width=args.desired_target_width)
         return cfg, build_pipeline_config(cfg), (w // 2, h // 2), \
-            (w // 2 - args.center_w // 2, h // 2 - args.center_h // 2, args.center_w, args.center_h)
+            (w // 2 - args.center_w // 2, h // 2 - args.center_h // 2,
+             args.center_w, args.center_h)
 
     loop_cfg, pcfg, (cx, cy), center_box = build_size_state(W, H)
     st = {"tracker": None, "controller": None, "locked": False}
-    invert_kenet = args.invert_kenet_yaw
-    invert_pilot = args.invert_pilot_yaw
-    bind_pulse = False
-    yaw_ctrl = 0.0  # smoothed yaw state
+    inv_ky, inv_kp = args.invert_kenet_yaw, args.invert_kenet_pitch
+    yaw_ctrl = pitch_ctrl = 0.0
 
     def do_lock(frame):
         tr = ObjectTracker(args.tracker)
@@ -111,7 +148,7 @@ def main() -> int:
             print("[UNLOCK]", flush=True)
         st.update(tracker=None, controller=None, locked=False)
 
-    win = "Kenet YAW closed-loop"
+    win = "Kenet closed-loop (yaw+pitch)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, W, H)
     cv2.moveWindow(win, args.win_x, args.win_y)
@@ -122,10 +159,25 @@ def main() -> int:
     gen = new_gen(region)
     manual_lock = False
     fps_disp = 0.0
-    tprev = time.monotonic()
-    last_geom = 0.0
-    last_status = 0.0
-    t0 = time.monotonic()
+    tprev = t0 = time.monotonic()
+    last_geom = last_status = last_tune = 0.0
+
+    tune = {"yaw_authority": args.yaw_authority, "max_yaw": args.max_yaw,
+            "yaw_slew": args.yaw_slew, "pitch_authority": args.pitch_authority,
+            "max_pitch": args.max_pitch, "pitch_slew": args.pitch_slew,
+            "center_w": float(args.center_w), "center_h": float(args.center_h)}
+
+    def reload_tune():
+        try:
+            with open(args.tune_file) as fh:
+                data = json.load(fh)
+            changed = {k: float(v) for k, v in data.items() if k in tune
+                       and float(v) != tune[k]}
+            if changed:
+                tune.update(changed)
+                print("tune updated: %s" % changed, flush=True)
+        except Exception:
+            pass
 
     def put(f, txt, row, col=(255, 255, 255)):
         y = 22 + row * 22
@@ -135,10 +187,17 @@ def main() -> int:
     try:
         while True:
             now = time.monotonic()
+            if now - last_tune >= 0.5:
+                last_tune = now
+                reload_tune()
+            # Recompute the centre lock box each frame so it can be resized live
+            # (takes effect on the next lock).
+            _bw, _bh = max(16, int(tune["center_w"])), max(16, int(tune["center_h"]))
+            center_box = (cx - _bw // 2, cy - _bh // 2, _bw, _bh)
             if now - last_geom >= args.geom_poll_s:
                 last_geom = now
                 try:
-                    nr = resolve_region(args.window_title, retries=1)
+                    nr = resolve_region(args.window_title, retries=1, exact=args.window_exact)
                 except Exception:
                     nr = None
                 if nr and any(nr[k] != region[k] for k in ("left", "top", "width", "height")):
@@ -163,34 +222,43 @@ def main() -> int:
                 continue
             frame = item.frame.copy()
 
-            # joystick: yaw (ch idx3) + CH6 (idx5)
-            ch_yaw = ch6 = None
+            # ---- pilot sticks from the TBS (js0) ----
+            p_roll = p_pitch = p_thr = p_yaw = 0.0
+            ch6 = None
             try:
                 joy.poll(timeout=0)
                 ch = make_channels(joy, CHANNEL_MAP)
-                ch_yaw, ch6 = int(ch[3]), int(ch[5])
+                p_roll = (ch[0] - 1500) / 500.0
+                p_pitch = (ch[1] - 1500) / 500.0
+                p_thr = (ch[2] - 1500) / 500.0
+                p_yaw = (ch[3] - 1500) / 500.0
+                ch6 = int(ch[5])
             except Exception:
                 pass
+            if args.invert_pilot_yaw:
+                p_yaw = -p_yaw
+            if args.invert_pilot_pitch:
+                p_pitch = -p_pitch
+
             state = "TRACKING" if (ch6 is not None and ch6 >= 1700) else \
                     ("ARMED" if (ch6 is not None and ch6 >= 1300) else
                      ("IDLE" if ch6 is not None else "n/a"))
             want_lock = (ch6 is not None and ch6 >= 1700) or manual_lock
-
             if want_lock and not st["locked"]:
                 do_lock(item.frame)
             elif not want_lock and st["locked"]:
                 do_unlock()
 
             found = False
-            kenet_yaw = pitch_show = yaw_err = 0.0
+            k_yaw = k_pitch = yaw_err = 0.0
             if st["locked"] and st["tracker"] is not None:
                 res = st["tracker"].update(item.frame)
                 st["controller"].update(res)
                 cmd = controller_command(st["controller"], pcfg, enable_pitch=True,
-                                         yaw_scale=loop_cfg.yaw_scale, pitch_scale=loop_cfg.pitch_scale)
+                                         yaw_scale=loop_cfg.yaw_scale,
+                                         pitch_scale=loop_cfg.pitch_scale)
                 found = res.found
-                kenet_yaw = cmd.yaw
-                pitch_show = cmd.pitch
+                k_yaw, k_pitch = cmd.yaw, cmd.pitch
                 yaw_err = st["controller"].yaw_error
                 if res.bbox:
                     x, y, w, h = [int(v) for v in res.bbox]
@@ -201,55 +269,74 @@ def main() -> int:
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 220), 2)
             cv2.drawMarker(frame, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 14, 1)
 
-            # ---- YAW MUX + smoothing -> virtual device ----
-            bind_active = bind_pulse or (args.bind_flag and os.path.exists(args.bind_flag))
-            if bind_active:
-                # Strong step-and-hold (not a continuous wave): Unity's interactive
-                # rebind ignores "noisy" continuously-moving controls, but locks
-                # onto a clean, large, sustained deflection. Repeat so a fresh
-                # 0 -> +0.9 actuation happens every ~1.5 s while pr0p listens.
-                phase = (now - t0) % 1.5
-                yaw_out = 0.9 if phase < 1.0 else 0.0
+            # ---- YAW mux ----
+            bind_y = os.path.exists(args.bind_flag_yaw)
+            bind_p = os.path.exists(args.bind_flag_pitch)
+            inv_ky = args.invert_kenet_yaw or os.path.exists(args.invert_flag_yaw)
+            inv_kp = args.invert_kenet_pitch or os.path.exists(args.invert_flag_pitch)
+            if bind_y:
+                yaw_out = step_pulse(now, t0)
                 yaw_ctrl = yaw_out
-                src = "BIND-STEP"
+                ysrc = "BIND"
             elif st["locked"]:
-                raw = -kenet_yaw if invert_kenet else kenet_yaw
-                target = clamp(raw * args.yaw_authority, -args.max_yaw, args.max_yaw)
-                yaw_ctrl += clamp(target - yaw_ctrl, -args.yaw_slew, args.yaw_slew)
+                tgt = clamp((-k_yaw if inv_ky else k_yaw) * tune["yaw_authority"],
+                            -tune["max_yaw"], tune["max_yaw"])
+                yaw_ctrl += clamp(tgt - yaw_ctrl, -tune["yaw_slew"], tune["yaw_slew"])
                 yaw_out = yaw_ctrl
-                src = "KENET"
+                ysrc = "KENET"
             else:
-                tbs = 0.0 if ch_yaw is None else (ch_yaw - 1500) / 500.0
-                if invert_pilot:
-                    tbs = -tbs
-                yaw_out = clamp(tbs, -1.0, 1.0)
+                yaw_out = clamp(p_yaw, -1, 1)
                 yaw_ctrl = yaw_out
-                src = "PILOT"
-            adapter.send(AxisCommand(yaw=clamp(yaw_out, -1, 1), pitch=0.0, roll=0.0, throttle=0.0))
+                ysrc = "PILOT"
+
+            # ---- PITCH mux ----
+            if bind_p:
+                pitch_out = step_pulse(now, t0)
+                pitch_ctrl = pitch_out
+                psrc = "BIND"
+            elif st["locked"] and not args.no_kenet_pitch:
+                tgt = clamp((-k_pitch if inv_kp else k_pitch) * tune["pitch_authority"],
+                            -tune["max_pitch"], tune["max_pitch"])
+                pitch_ctrl += clamp(tgt - pitch_ctrl, -tune["pitch_slew"], tune["pitch_slew"])
+                pitch_out = pitch_ctrl
+                psrc = "KENET"
+            else:
+                pitch_out = clamp(p_pitch, -1, 1)
+                pitch_ctrl = pitch_out
+                psrc = "PILOT"
+
+            # roll/throttle: always mirror the pilot (safety net for generic bindings)
+            adapter.send(AxisCommand(yaw=clamp(yaw_out, -1, 1),
+                                     pitch=clamp(pitch_out, -1, 1),
+                                     roll=clamp(p_roll, -1, 1),
+                                     throttle=clamp(p_thr, -1, 1)))
 
             dt = now - tprev
             tprev = now
             if dt > 0:
                 fps_disp = 0.9 * fps_disp + 0.1 * (1.0 / dt)
 
-            banner = "YAW->virtual  src=%s%s" % (src, "  [BINDING]" if bind_active else "")
-            put(frame, banner, 0, (0, 180, 255) if src != "KENET" else (0, 220, 0))
-            put(frame, "CH6=%s state=%s locked=%s  yaw_out=%+.2f" % (
-                ch6 if ch6 is not None else "n/a", state, st["locked"], yaw_out), 1)
+            col_y = (0, 220, 0) if ysrc == "KENET" else ((0, 0, 255) if ysrc == "BIND" else (0, 180, 255))
+            put(frame, "yaw=%s %+.2f   pitch=%s %+.2f   (roll/thr = pilot)" % (
+                ysrc, yaw_out, psrc, pitch_out), 0, col_y)
+            put(frame, "CH6=%s state=%s locked=%s" % (
+                ch6 if ch6 is not None else "n/a", state, st["locked"]), 1)
             if st["locked"]:
-                put(frame, "FOUND=%s yaw_err=%.0fpx  kenet_yaw=%+.2f (pitch %+.2f shown, NOT sent)" % (
-                    found, yaw_err, kenet_yaw, pitch_show), 2, (0, 220, 0) if found else (0, 0, 255))
+                put(frame, "FOUND=%s yaw_err=%.0fpx  kenet yaw=%+.2f pitch=%+.2f" % (
+                    found, yaw_err, k_yaw, k_pitch), 2, (0, 220, 0) if found else (0, 0, 255))
             else:
-                put(frame, "Center target, flip CH6 TRACKING to hand yaw to Kenet", 2)
-            put(frame, "inv_kenet=%s inv_pilot=%s auth=%.2f  [b-bind i-inv p-invpilot q-quit]" % (
-                invert_kenet, invert_pilot, args.yaw_authority), 3, (180, 180, 180))
+                put(frame, "Center target, flip CH6 TRACKING to hand yaw+pitch to Kenet", 2)
+            put(frame, "inv_kenet yaw=%s pitch=%s  [i/o invert, space lock, q quit]" % (
+                inv_ky, inv_kp), 3, (180, 180, 180))
             put(frame, "fps=%.1f" % fps_disp, 4, (180, 180, 180))
 
             cv2.imshow(win, frame)
             if now - last_status >= 1.0:
                 last_status = now
-                print("src=%s state=%s locked=%s found=%s yaw_out=%+.2f kenet_yaw=%+.2f fps=%.1f" % (
-                    src, state, st["locked"], found, yaw_out, kenet_yaw, fps_disp), flush=True)
+                print("yaw=%s%+.2f pitch=%s%+.2f state=%s locked=%s found=%s "
+                      "kenet(y=%+.2f p=%+.2f) fps=%.1f" % (
+                          ysrc, yaw_out, psrc, pitch_out, state, st["locked"], found,
+                          k_yaw, k_pitch, fps_disp), flush=True)
 
             k = cv2.waitKey(1) & 0xFF
             if k in (ord('q'), 27):
@@ -258,15 +345,15 @@ def main() -> int:
                 manual_lock = not manual_lock
             elif k == ord('r'):
                 manual_lock = False
-            elif k == ord('b'):
-                bind_pulse = not bind_pulse
-                print("bind_pulse=%s" % bind_pulse, flush=True)
-            elif k == ord('i'):
-                invert_kenet = not invert_kenet
-                print("invert_kenet=%s" % invert_kenet, flush=True)
-            elif k == ord('p'):
-                invert_pilot = not invert_pilot
-                print("invert_pilot=%s" % invert_pilot, flush=True)
+            elif k in (ord('i'), ord('o')):
+                # Toggle the flag file, which is the single source of truth for
+                # the sign (so it can also be flipped from outside, without focus).
+                path = args.invert_flag_yaw if k == ord('i') else args.invert_flag_pitch
+                if os.path.exists(path):
+                    os.remove(path)
+                else:
+                    open(path, "w").close()
+                print("invert flag %s -> %s" % (path, os.path.exists(path)), flush=True)
             try:
                 if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                     break
@@ -276,7 +363,6 @@ def main() -> int:
         print("VIEWER ERROR: %s: %s" % (type(exc).__name__, exc), flush=True)
     finally:
         try:
-            adapter.send(AxisCommand(yaw=0.0, pitch=0.0, roll=0.0, throttle=0.0))
             adapter.neutral()
             adapter.close()
         except Exception:
